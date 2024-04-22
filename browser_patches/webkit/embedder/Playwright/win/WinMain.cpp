@@ -70,6 +70,7 @@ static void configureDataStore(WKWebsiteDataStoreRef dataStore) {
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpstrCmdLine, _In_ int nCmdShow)
 {
+    hInst = hInstance;
 #ifdef _CRTDBG_MAP_ALLOC
     _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -101,7 +102,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     if (SetProcessDpiAwarenessContextPtr())
         SetProcessDpiAwarenessContextPtr()(DPI_AWARENESS_CONTEXT_UNAWARE);
 
-    MainWindow::configure(g_options.headless, g_options.noStartupWindow);
+    MainWindow::configure(g_options.headless, g_options.inspectorPipe, g_options.disableAcceleratedCompositing);
 
     if (!g_options.noStartupWindow) {
         auto configuration = adoptWK(WKWebsiteDataStoreConfigurationCreate());
@@ -119,7 +120,6 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         }
         auto context = adoptWK(WKContextCreateWithConfiguration(nullptr));
         auto dataStore = adoptWK(WKWebsiteDataStoreCreateWithConfiguration(configuration.get()));
-        WKContextSetPrimaryDataStore(context.get(), dataStore.get());
         configureDataStore(dataStore.get());
 
         auto* mainWindow = new MainWindow();
@@ -165,9 +165,4 @@ exit:
     OleUninitialize();
 
     return static_cast<int>(msg.wParam);
-}
-
-extern "C" __declspec(dllexport) int WINAPI dllLauncherEntryPoint(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpstrCmdLine, int nCmdShow)
-{
-    return wWinMain(hInstance, hPrevInstance, lpstrCmdLine, nCmdShow);
 }

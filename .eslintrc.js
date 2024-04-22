@@ -1,10 +1,13 @@
 module.exports = {
-    parser: '@typescript-eslint/parser',
-    plugins: ['@typescript-eslint', 'notice'],
+    parser: "@typescript-eslint/parser",
+    plugins: ["@typescript-eslint", "notice"],
     parserOptions: {
       ecmaVersion: 9,
-      sourceType: 'module',
+      sourceType: "module",
     },
+    extends: [
+      "plugin:react-hooks/recommended"
+    ],
 
     /**
      * ESLint rules
@@ -15,18 +18,20 @@ module.exports = {
      *   "rule-name", [severity, { opts }]
      * Severity: 2 == error, 1 == warning, 0 == off.
      */
-    "rules": {
-        '@typescript-eslint/no-unused-vars': [2, {args: 'none'}],
+    rules: {
+        "@typescript-eslint/no-unused-vars": [2, {args: "none"}],
+        "@typescript-eslint/consistent-type-imports": [2, {disallowTypeAnnotations: false}],
         /**
          * Enforced rules
          */
         // syntax preferences
+        "object-curly-spacing": ["error", "always"],
         "quotes": [2, "single", {
             "avoidEscape": true,
             "allowTemplateLiterals": true
         }],
-        "semi": 2,
         "no-extra-semi": 2,
+        "@typescript-eslint/semi": [2],
         "comma-style": [2, "last"],
         "wrap-iife": [2, "inside"],
         "spaced-comment": [2, "always", {
@@ -43,6 +48,7 @@ module.exports = {
         "arrow-parens": [2, "as-needed"],
         "prefer-const": 2,
         "quote-props": [2, "consistent"],
+        "nonblock-statement-body-position": [2, "below"],
 
         // anti-patterns
         "no-var": 2,
@@ -65,6 +71,8 @@ module.exports = {
         "radix": 2,
         "valid-typeof": 2,
         "no-implicit-globals": [2],
+        "no-unused-expressions": [2, { "allowShortCircuit": true, "allowTernary": true, "allowTaggedTemplates": true}],
+        "no-proto": 2,
 
         // es2015 features
         "require-yield": 2,
@@ -73,6 +81,9 @@ module.exports = {
         // spacing details
         "space-infix-ops": 2,
         "space-in-parens": [2, "never"],
+        "array-bracket-spacing": [2, "never"],
+        "comma-spacing": [2, { "before": false, "after": true }],
+        "keyword-spacing": [2, "always"],
         "space-before-function-paren": [2, {
             "anonymous": "never",
             "named": "never",
@@ -110,7 +121,7 @@ module.exports = {
         // copyright
         "notice/notice": [2, {
             "mustMatch": "Copyright",
-            "templateFile": "./utils/copyright.js",
+            "templateFile": require("path").join(__dirname, "utils", "copyright.js"),
         }],
     }
 };

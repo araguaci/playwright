@@ -36,13 +36,30 @@
 #include <vpx/vp8.h>
 #include <vpx/vp8cx.h>
 #include <vpx/vpx_encoder.h>
+#include "nsIThread.h"
 #include "nsThreadUtils.h"
 #include "WebMFileWriter.h"
-#include "webrtc/api/video/video_frame.h"
+#include "api/video/video_frame.h"
 
 namespace mozilla {
 
 namespace {
+
+struct VpxCodecDeleter {
+  void operator()(vpx_codec_ctx_t* codec) {
+    if (codec) {
+        vpx_codec_err_t ret = vpx_codec_destroy(codec);
+        if (ret != VPX_CODEC_OK)
+            fprintf(stderr, "Failed to destroy codec: %s\n", vpx_codec_error(codec));
+    }
+  }
+};
+
+using ScopedVpxCodec = std::unique_ptr<vpx_codec_ctx_t, VpxCodecDeleter>;
+
+// Number of timebase unints per one frame.
+constexpr int timeScale = 1000;
+
 // Defines the dimension of a macro block. This is used to compute the active
 // map for the encoder.
 const int kMacroBlockSize = 16;
@@ -105,14 +122,13 @@ void createImage(unsigned int width, unsigned int height,
 
 class ScreencastEncoder::VPXFrame {
 public:
-    VPXFrame(rtc::scoped_refptr<webrtc::VideoFrameBuffer>&& buffer, Maybe<double> scale, const gfx::IntMargin& margin)
+    VPXFrame(rtc::scoped_refptr<webrtc::VideoFrameBuffer>&& buffer, const gfx::IntMargin& margin)
         : m_frameBuffer(std::move(buffer))
-        , m_scale(scale)
         , m_margin(margin)
     { }
 
-    void setDuration(int duration) { m_duration = duration; }
-    int duration() const { return m_duration; }
+    void setDuration(TimeDuration duration) { m_duration = duration; }
+    TimeDuration duration() const { return m_duration; }
 
     void convertToVpxImage(vpx_image_t* image)
     {
@@ -122,30 +138,56 @@ public:
         }
 
         auto src = m_frameBuffer->GetI420();
-
-        const int y_stride = image->stride[0];
-        MOZ_ASSERT(image->stride[1] == image->stride[2]);
+        const int y_stride = image->stride[VPX_PLANE_Y];
+        MOZ_ASSERT(image->stride[VPX_PLANE_U] == image->stride[VPX_PLANE_V]);
         const int uv_stride = image->stride[1];
-        uint8_t* y_data = image->planes[0];
-        uint8_t* u_data = image->planes[1];
-        uint8_t* v_data = image->planes[2];
+        uint8_t* y_data = image->planes[VPX_PLANE_Y];
+        uint8_t* u_data = image->planes[VPX_PLANE_U];
+        uint8_t* v_data = image->planes[VPX_PLANE_V];
 
-        if (m_scale) {
-          int src_width = src->width() - m_margin.LeftRight();
-          double dst_width = src_width * m_scale.value();
+        /**
+         * Let's say we have the following image of 6x3 pixels (same number = same pixel value):
+         *  112233
+         *  112233
+         *  445566
+         * In I420 format (see https://en.wikipedia.org/wiki/YUV), the image will have the following data planes:
+         *   Y [stride_Y = 6]:
+         *    112233
+         *    112233
+         *    445566
+         *   U [stride_U = 3] - this plane has aggregate for each 2x2 pixels:
+         *    123
+         *    456
+         *   V [stride_V = 3] - this plane has aggregate for each 2x2 pixels:
+         *    123
+         *    456
+         *
+         * To crop this image efficiently, we can move src_Y/U/V pointer and
+         * adjust the src_width and src_height. However, we must cut off only **even**
+         * amount of lines and columns to retain semantic of U and V planes which
+         * contain only 1/4 of pixel information.
+         */
+        int yuvTopOffset = m_margin.top + (m_margin.top & 1);
+        int yuvLeftOffset = m_margin.left + (m_margin.left & 1);
+
+        double src_width = src->width() - yuvLeftOffset;
+        double src_height = src->height() - yuvTopOffset;
+
+        if (src_width > image->w || src_height > image->h) {
+          double scale = std::min(image->w / src_width, image->h / src_height);
+          double dst_width = src_width * scale;
           if (dst_width > image->w) {
             src_width *= image->w / dst_width;
             dst_width = image->w;
           }
-          int src_height = src->height() - m_margin.TopBottom();
-          double dst_height = src_height * m_scale.value();
+          double dst_height = src_height * scale;
           if (dst_height > image->h) {
             src_height *= image->h / dst_height;
             dst_height = image->h;
           }
-          libyuv::I420Scale(src->DataY() + m_margin.top * src->StrideY() + m_margin.left, src->StrideY(),
-                            src->DataU() + (m_margin.top * src->StrideU() + m_margin.left) / 2, src->StrideU(),
-                            src->DataV() + (m_margin.top * src->StrideV() + m_margin.left) / 2, src->StrideV(),
+          libyuv::I420Scale(src->DataY() + yuvTopOffset * src->StrideY() + yuvLeftOffset, src->StrideY(),
+                            src->DataU() + (yuvTopOffset * src->StrideU() + yuvLeftOffset) / 2, src->StrideU(),
+                            src->DataV() + (yuvTopOffset * src->StrideV() + yuvLeftOffset) / 2, src->StrideV(),
                             src_width, src_height,
                             y_data, y_stride,
                             u_data, uv_stride,
@@ -153,12 +195,12 @@ public:
                             dst_width, dst_height,
                             libyuv::kFilterBilinear);
         } else {
-          int width = std::min<int>(image->w, src->width() - m_margin.LeftRight());
-          int height = std::min<int>(image->h, src->height() - m_margin.TopBottom());
+          int width = std::min<int>(image->w, src_width);
+          int height = std::min<int>(image->h, src_height);
 
-          libyuv::I420Copy(src->DataY() + m_margin.top * src->StrideY() + m_margin.left, src->StrideY(),
-                           src->DataU() + (m_margin.top * src->StrideU() + m_margin.left) / 2, src->StrideU(),
-                           src->DataV() + (m_margin.top * src->StrideV() + m_margin.left) / 2, src->StrideV(),
+          libyuv::I420Copy(src->DataY() + yuvTopOffset * src->StrideY() + yuvLeftOffset, src->StrideY(),
+                           src->DataU() + (yuvTopOffset * src->StrideU() + yuvLeftOffset) / 2, src->StrideU(),
+                           src->DataV() + (yuvTopOffset * src->StrideV() + yuvLeftOffset) / 2, src->StrideV(),
                            y_data, y_stride,
                            u_data, uv_stride,
                            v_data, uv_stride,
@@ -168,16 +210,15 @@ public:
 
 private:
     rtc::scoped_refptr<webrtc::VideoFrameBuffer> m_frameBuffer;
-    Maybe<double> m_scale;
     gfx::IntMargin m_margin;
-    int m_duration = 0;
+    TimeDuration m_duration;
 };
 
 
 class ScreencastEncoder::VPXCodec {
 public:
-    VPXCodec(vpx_codec_ctx_t codec, vpx_codec_enc_cfg_t cfg, FILE* file)
-        : m_codec(codec)
+    VPXCodec(ScopedVpxCodec codec, vpx_codec_enc_cfg_t cfg, FILE* file)
+        : m_codec(std::move(codec))
         , m_cfg(cfg)
         , m_file(file)
         , m_writer(new WebMFileWriter(file, &m_cfg))
@@ -201,7 +242,14 @@ public:
         m_encoderQueue->Dispatch(NS_NewRunnableFunction("VPXCodec::encodeFrameAsync", [this, frame = std::move(frame)] {
             memset(m_imageBuffer.get(), 128, m_imageBufferSize);
             frame->convertToVpxImage(m_image.get());
-            encodeFrame(m_image.get(), frame->duration());
+
+            double frameCount = frame->duration().ToSeconds() * fps;
+            // For long duration repeat frame at 1 fps to ensure last frame duration is short enough.
+            // TODO: figure out why simply passing duration doesn't work well.
+            for (;frameCount > 1.5; frameCount -= 1) {
+                encodeFrame(m_image.get(), timeScale);
+            }
+            encodeFrame(m_image.get(), std::max<int>(1, frameCount * timeScale));
         }));
     }
 
@@ -219,21 +267,20 @@ private:
         vpx_codec_iter_t iter = nullptr;
         const vpx_codec_cx_pkt_t *pkt = nullptr;
         int flags = 0;
-        const vpx_codec_err_t res = vpx_codec_encode(&m_codec, img, m_pts, duration, flags, VPX_DL_REALTIME);
+        const vpx_codec_err_t res = vpx_codec_encode(m_codec.get(), img, m_pts, duration, flags, VPX_DL_REALTIME);
         if (res != VPX_CODEC_OK) {
-            fprintf(stderr, "Failed to encode frame: %s\n", vpx_codec_error(&m_codec));
+            fprintf(stderr, "Failed to encode frame: %s\n", vpx_codec_error(m_codec.get()));
             return false;
         }
 
         bool gotPkts = false;
-        while ((pkt = vpx_codec_get_cx_data(&m_codec, &iter)) != nullptr) {
+        while ((pkt = vpx_codec_get_cx_data(m_codec.get(), &iter)) != nullptr) {
             gotPkts = true;
 
             if (pkt->kind == VPX_CODEC_CX_FRAME_PKT) {
                 m_writer->writeFrame(pkt);
-                bool keyframe = (pkt->data.frame.flags & VPX_FRAME_IS_KEY) != 0;
                 ++m_frameCount;
-                fprintf(stderr, "  #%03d %spts=%" PRId64 " sz=%zd\n", m_frameCount, keyframe ? "[K] " : "", pkt->data.frame.pts, pkt->data.frame.sz);
+                // fprintf(stderr, "  #%03d %spts=%" PRId64 " sz=%zd\n", m_frameCount, (pkt->data.frame.flags & VPX_FRAME_IS_KEY) != 0 ? "[K] " : "", pkt->data.frame.pts, pkt->data.frame.sz);
                 m_pts += pkt->data.frame.duration;
             }
         }
@@ -249,11 +296,11 @@ private:
 
         m_writer->finish();
         fclose(m_file);
-        fprintf(stderr, "ScreencastEncoder::finish %d frames\n", m_frameCount);
+        // fprintf(stderr, "ScreencastEncoder::finish %d frames\n", m_frameCount);
     }
 
     RefPtr<nsIThread> m_encoderQueue;
-    vpx_codec_ctx_t m_codec;
+    ScopedVpxCodec m_codec;
     vpx_codec_enc_cfg_t m_cfg;
     FILE* m_file { nullptr };
     std::unique_ptr<WebMFileWriter> m_writer;
@@ -264,9 +311,8 @@ private:
     std::unique_ptr<vpx_image_t> m_image;
 };
 
-ScreencastEncoder::ScreencastEncoder(std::unique_ptr<VPXCodec>&& vpxCodec, Maybe<double> scale, const gfx::IntMargin& margin)
+ScreencastEncoder::ScreencastEncoder(std::unique_ptr<VPXCodec> vpxCodec, const gfx::IntMargin& margin)
     : m_vpxCodec(std::move(vpxCodec))
-    , m_scale(scale)
     , m_margin(margin)
 {
 }
@@ -275,9 +321,7 @@ ScreencastEncoder::~ScreencastEncoder()
 {
 }
 
-static constexpr int fps = 24;
-
-RefPtr<ScreencastEncoder> ScreencastEncoder::create(nsCString& errorString, const nsCString& filePath, int width, int height, Maybe<double> scale, const gfx::IntMargin& margin)
+std::unique_ptr<ScreencastEncoder> ScreencastEncoder::create(nsCString& errorString, const nsCString& filePath, int width, int height, const gfx::IntMargin& margin)
 {
     vpx_codec_iface_t* codec_interface = vpx_codec_vp8_cx();
     if (!codec_interface) {
@@ -301,12 +345,12 @@ RefPtr<ScreencastEncoder> ScreencastEncoder::create(nsCString& errorString, cons
     cfg.g_w = width;
     cfg.g_h = height;
     cfg.g_timebase.num = 1;
-    cfg.g_timebase.den = fps;
+    cfg.g_timebase.den = fps * timeScale;
     cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
 
-    vpx_codec_ctx_t codec;
-    if (vpx_codec_enc_init(&codec, codec_interface, &cfg, 0)) {
-        errorString.AppendPrintf("Failed to initialize encoder: %s", vpx_codec_error(&codec));
+    ScopedVpxCodec codec(new vpx_codec_ctx_t);
+    if (vpx_codec_enc_init(codec.get(), codec_interface, &cfg, 0)) {
+        errorString.AppendPrintf("Failed to initialize encoder: %s", vpx_codec_error(codec.get()));
         return nullptr;
     }
 
@@ -316,9 +360,9 @@ RefPtr<ScreencastEncoder> ScreencastEncoder::create(nsCString& errorString, cons
         return nullptr;
     }
 
-    std::unique_ptr<VPXCodec> vpxCodec(new VPXCodec(codec, cfg, file));
-    fprintf(stderr, "ScreencastEncoder initialized with: %s\n", vpx_codec_iface_name(codec_interface));
-    return new ScreencastEncoder(std::move(vpxCodec), scale, margin);
+    std::unique_ptr<VPXCodec> vpxCodec(new VPXCodec(std::move(codec), cfg, file));
+    // fprintf(stderr, "ScreencastEncoder initialized with: %s\n", vpx_codec_iface_name(codec_interface));
+    return std::make_unique<ScreencastEncoder>(std::move(vpxCodec), margin);
 }
 
 void ScreencastEncoder::flushLastFrame()
@@ -329,9 +373,7 @@ void ScreencastEncoder::flushLastFrame()
         if (!m_lastFrame)
             return;
 
-        TimeDuration seconds = now - m_lastFrameTimestamp;
-        int duration = 1 + seconds.ToSeconds() * fps; // Duration in timebase units
-        m_lastFrame->setDuration(duration);
+        m_lastFrame->setDuration(now - m_lastFrameTimestamp);
         m_vpxCodec->encodeFrameAsync(std::move(m_lastFrame));
     }
     m_lastFrameTimestamp = now;
@@ -339,10 +381,10 @@ void ScreencastEncoder::flushLastFrame()
 
 void ScreencastEncoder::encodeFrame(const webrtc::VideoFrame& videoFrame)
 {
-    fprintf(stderr, "ScreencastEncoder::encodeFrame\n");
+    // fprintf(stderr, "ScreencastEncoder::encodeFrame\n");
     flushLastFrame();
 
-    m_lastFrame = std::make_unique<VPXFrame>(videoFrame.video_frame_buffer(), m_scale, m_margin);
+    m_lastFrame = std::make_unique<VPXFrame>(videoFrame.video_frame_buffer(), m_margin);
 }
 
 void ScreencastEncoder::finish(std::function<void()>&& callback)

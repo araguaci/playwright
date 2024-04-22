@@ -4,14 +4,16 @@
 
 "use strict";
 
-const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
+const {AddonManager} = ChromeUtils.import("resource://gre/modules/AddonManager.jsm");
 const {TargetRegistry} = ChromeUtils.import("chrome://juggler/content/TargetRegistry.js");
 const {Helper} = ChromeUtils.import('chrome://juggler/content/Helper.js');
+const {PageHandler} = ChromeUtils.import("chrome://juggler/content/protocol/PageHandler.js");
+const {AppConstants} = ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
 
 const helper = new Helper();
 
 class BrowserHandler {
-  constructor(session, dispatcher, targetRegistry, onclose) {
+  constructor(session, dispatcher, targetRegistry, startCompletePromise, onclose) {
     this._session = session;
     this._dispatcher = dispatcher;
     this._targetRegistry = targetRegistry;
@@ -21,25 +23,25 @@ class BrowserHandler {
     this._createdBrowserContextIds = new Set();
     this._attachedSessions = new Map();
     this._onclose = onclose;
+    this._startCompletePromise = startCompletePromise;
   }
 
-  async enable({attachToDefaultContext}) {
+  async ['Browser.enable']({attachToDefaultContext, userPrefs = []}) {
     if (this._enabled)
       return;
+    await this._startCompletePromise;
     this._enabled = true;
     this._attachToDefaultContext = attachToDefaultContext;
 
-    for (const target of this._targetRegistry.targets()) {
-      if (!this._shouldAttachToTarget(target))
-        continue;
-      const session = this._dispatcher.createSession();
-      this._attachedSessions.set(target, session);
-      this._session.emitEvent('Browser.attachedToTarget', {
-        sessionId: session.sessionId(),
-        targetInfo: target.info()
-      });
-      target.initSession(session);
-      target.connectSession(session);
+    for (const { name, value } of userPrefs) {
+      if (value === true || value === false)
+        Services.prefs.setBoolPref(name, value);
+      else if (typeof value === 'string')
+        Services.prefs.setStringPref(name, value);
+      else if (typeof value === 'number')
+        Services.prefs.setIntPref(name, value);
+      else
+        throw new Error(`Preference "${name}" has unsupported value: ${JSON.stringify(value)}`);
     }
 
     this._eventListeners = [
@@ -47,16 +49,16 @@ class BrowserHandler {
       helper.on(this._targetRegistry, TargetRegistry.Events.TargetDestroyed, this._onTargetDestroyed.bind(this)),
       helper.on(this._targetRegistry, TargetRegistry.Events.DownloadCreated, this._onDownloadCreated.bind(this)),
       helper.on(this._targetRegistry, TargetRegistry.Events.DownloadFinished, this._onDownloadFinished.bind(this)),
+      helper.on(this._targetRegistry, TargetRegistry.Events.ScreencastStopped, sessionId => {
+        this._session.emitEvent('Browser.videoRecordingFinished', {screencastId: '' + sessionId});
+      })
     ];
 
-    const onScreencastStopped = (subject, topic, data) => {
-      this._session.emitEvent('Browser.screencastFinished', {screencastId: '' + data});
-    };
-    Services.obs.addObserver(onScreencastStopped, 'juggler-screencast-stopped');
-    this._eventListeners.push(() => Services.obs.removeObserver(onScreencastStopped, 'juggler-screencast-stopped'));
+    for (const target of this._targetRegistry.targets())
+      this._onTargetCreated(target);
   }
 
-  async createBrowserContext({removeOnDetach}) {
+  async ['Browser.createBrowserContext']({removeOnDetach}) {
     if (!this._enabled)
       throw new Error('Browser domain is not enabled');
     const browserContext = this._targetRegistry.createBrowserContext(removeOnDetach);
@@ -64,7 +66,7 @@ class BrowserHandler {
     return {browserContextId: browserContext.browserContextId};
   }
 
-  async removeBrowserContext({browserContextId}) {
+  async ['Browser.removeBrowserContext']({browserContextId}) {
     if (!this._enabled)
       throw new Error('Browser domain is not enabled');
     await this._targetRegistry.browserContextForId(browserContextId).destroy();
@@ -73,10 +75,8 @@ class BrowserHandler {
 
   dispose() {
     helper.removeListeners(this._eventListeners);
-    for (const [target, session] of this._attachedSessions) {
-      target.disconnectSession(session);
+    for (const [target, session] of this._attachedSessions)
       this._dispatcher.destroySession(session);
-    }
     this._attachedSessions.clear();
     for (const browserContextId of this._createdBrowserContextIds) {
       const browserContext = this._targetRegistry.browserContextForId(browserContextId);
@@ -87,24 +87,22 @@ class BrowserHandler {
   }
 
   _shouldAttachToTarget(target) {
-    if (!target._browserContext)
-      return false;
     if (this._createdBrowserContextIds.has(target._browserContext.browserContextId))
       return true;
     return this._attachToDefaultContext && target._browserContext === this._targetRegistry.defaultContext();
   }
 
-  _onTargetCreated({sessions, target}) {
+  _onTargetCreated(target) {
     if (!this._shouldAttachToTarget(target))
       return;
+    const channel = target.channel();
     const session = this._dispatcher.createSession();
     this._attachedSessions.set(target, session);
     this._session.emitEvent('Browser.attachedToTarget', {
       sessionId: session.sessionId(),
       targetInfo: target.info()
     });
-    target.initSession(session);
-    sessions.push(session);
+    session.setHandler(new PageHandler(target, session, channel));
   }
 
   _onTargetDestroyed(target) {
@@ -127,133 +125,185 @@ class BrowserHandler {
     this._session.emitEvent('Browser.downloadFinished', downloadInfo);
   }
 
-  async newPage({browserContextId}) {
+  async ['Browser.cancelDownload']({uuid}) {
+    await this._targetRegistry.cancelDownload({uuid});
+  }
+
+  async ['Browser.newPage']({browserContextId}) {
     const targetId = await this._targetRegistry.newPage({browserContextId});
     return {targetId};
   }
 
-  async close() {
+  async ['Browser.close']() {
     let browserWindow = Services.wm.getMostRecentWindow(
       "navigator:browser"
     );
     if (browserWindow && browserWindow.gBrowserInit) {
-      await browserWindow.gBrowserInit.idleTasksFinishedPromise;
+      // idleTasksFinishedPromise does not resolve when the window
+      // is closed early enough, so we race against window closure.
+      await Promise.race([
+        browserWindow.gBrowserInit.idleTasksFinishedPromise,
+        waitForWindowClosed(browserWindow),
+      ]);
     }
+    await this._startCompletePromise;
     this._onclose();
     Services.startup.quit(Ci.nsIAppStartup.eForceQuit);
   }
 
-  async grantPermissions({browserContextId, origin, permissions}) {
+  async ['Browser.grantPermissions']({browserContextId, origin, permissions}) {
     await this._targetRegistry.browserContextForId(browserContextId).grantPermissions(origin, permissions);
   }
 
-  resetPermissions({browserContextId}) {
+  async ['Browser.resetPermissions']({browserContextId}) {
     this._targetRegistry.browserContextForId(browserContextId).resetPermissions();
   }
 
-  setExtraHTTPHeaders({browserContextId, headers}) {
+  ['Browser.setExtraHTTPHeaders']({browserContextId, headers}) {
     this._targetRegistry.browserContextForId(browserContextId).extraHTTPHeaders = headers;
   }
 
-  setHTTPCredentials({browserContextId, credentials}) {
+  ['Browser.clearCache']() {
+    // Clearing only the context cache does not work: https://bugzilla.mozilla.org/show_bug.cgi?id=1819147
+    Services.cache2.clear();
+    ChromeUtils.clearStyleSheetCache();
+  }
+
+  ['Browser.setHTTPCredentials']({browserContextId, credentials}) {
     this._targetRegistry.browserContextForId(browserContextId).httpCredentials = nullToUndefined(credentials);
   }
 
-  async setBrowserProxy({type, host, port, bypass, username, password}) {
+  async ['Browser.setBrowserProxy']({type, host, port, bypass, username, password}) {
     this._targetRegistry.setBrowserProxy({ type, host, port, bypass, username, password});
   }
 
-  async setContextProxy({browserContextId, type, host, port, bypass, username, password}) {
+  async ['Browser.setContextProxy']({browserContextId, type, host, port, bypass, username, password}) {
     const browserContext = this._targetRegistry.browserContextForId(browserContextId);
     browserContext.setProxy({ type, host, port, bypass, username, password });
   }
 
-  setRequestInterception({browserContextId, enabled}) {
+  ['Browser.setRequestInterception']({browserContextId, enabled}) {
     this._targetRegistry.browserContextForId(browserContextId).requestInterceptionEnabled = enabled;
   }
 
-  setIgnoreHTTPSErrors({browserContextId, ignoreHTTPSErrors}) {
+  ['Browser.setIgnoreHTTPSErrors']({browserContextId, ignoreHTTPSErrors}) {
     this._targetRegistry.browserContextForId(browserContextId).setIgnoreHTTPSErrors(nullToUndefined(ignoreHTTPSErrors));
   }
 
-  setDownloadOptions({browserContextId, downloadOptions}) {
+  ['Browser.setDownloadOptions']({browserContextId, downloadOptions}) {
     this._targetRegistry.browserContextForId(browserContextId).downloadOptions = nullToUndefined(downloadOptions);
   }
 
-  async setGeolocationOverride({browserContextId, geolocation}) {
+  async ['Browser.setGeolocationOverride']({browserContextId, geolocation}) {
     await this._targetRegistry.browserContextForId(browserContextId).applySetting('geolocation', nullToUndefined(geolocation));
   }
 
-  async setOnlineOverride({browserContextId, override}) {
-    await this._targetRegistry.browserContextForId(browserContextId).applySetting('onlineOverride', nullToUndefined(override));
+  async ['Browser.setOnlineOverride']({browserContextId, override}) {
+    const forceOffline = override === 'offline';
+    await this._targetRegistry.browserContextForId(browserContextId).setForceOffline(forceOffline);
   }
 
-  async setColorScheme({browserContextId, colorScheme}) {
-    await this._targetRegistry.browserContextForId(browserContextId).applySetting('colorScheme', nullToUndefined(colorScheme));
+  async ['Browser.setColorScheme']({browserContextId, colorScheme}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setColorScheme(nullToUndefined(colorScheme));
   }
 
-  async setScreencastOptions({browserContextId, dir, width, height, scale}) {
-    await this._targetRegistry.browserContextForId(browserContextId).setScreencastOptions({dir, width, height, scale});
+  async ['Browser.setReducedMotion']({browserContextId, reducedMotion}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setReducedMotion(nullToUndefined(reducedMotion));
   }
 
-  async setUserAgentOverride({browserContextId, userAgent}) {
-    await this._targetRegistry.browserContextForId(browserContextId).applySetting('userAgent', nullToUndefined(userAgent));
+  async ['Browser.setForcedColors']({browserContextId, forcedColors}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setForcedColors(nullToUndefined(forcedColors));
   }
 
-  async setBypassCSP({browserContextId, bypassCSP}) {
+  async ['Browser.setVideoRecordingOptions']({browserContextId, options}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setVideoRecordingOptions(options);
+  }
+
+  async ['Browser.setUserAgentOverride']({browserContextId, userAgent}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setDefaultUserAgent(userAgent);
+  }
+
+  async ['Browser.setPlatformOverride']({browserContextId, platform}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setDefaultPlatform(platform);
+  }
+
+  async ['Browser.setBypassCSP']({browserContextId, bypassCSP}) {
     await this._targetRegistry.browserContextForId(browserContextId).applySetting('bypassCSP', nullToUndefined(bypassCSP));
   }
 
-  async setJavaScriptDisabled({browserContextId, javaScriptDisabled}) {
+  async ['Browser.setJavaScriptDisabled']({browserContextId, javaScriptDisabled}) {
     await this._targetRegistry.browserContextForId(browserContextId).applySetting('javaScriptDisabled', nullToUndefined(javaScriptDisabled));
   }
 
-  async setLocaleOverride({browserContextId, locale}) {
+  async ['Browser.setLocaleOverride']({browserContextId, locale}) {
     await this._targetRegistry.browserContextForId(browserContextId).applySetting('locale', nullToUndefined(locale));
   }
 
-  async setTimezoneOverride({browserContextId, timezoneId}) {
+  async ['Browser.setTimezoneOverride']({browserContextId, timezoneId}) {
     await this._targetRegistry.browserContextForId(browserContextId).applySetting('timezoneId', nullToUndefined(timezoneId));
   }
 
-  async setTouchOverride({browserContextId, hasTouch}) {
-    await this._targetRegistry.browserContextForId(browserContextId).applySetting('hasTouch', nullToUndefined(hasTouch));
+  async ['Browser.setTouchOverride']({browserContextId, hasTouch}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setTouchOverride(nullToUndefined(hasTouch));
   }
 
-  async setDefaultViewport({browserContextId, viewport}) {
+  async ['Browser.setDefaultViewport']({browserContextId, viewport}) {
     await this._targetRegistry.browserContextForId(browserContextId).setDefaultViewport(nullToUndefined(viewport));
   }
 
-  async addScriptToEvaluateOnNewDocument({browserContextId, script}) {
-    await this._targetRegistry.browserContextForId(browserContextId).addScriptToEvaluateOnNewDocument(script);
+  async ['Browser.setScrollbarsHidden']({browserContextId, hidden}) {
+    await this._targetRegistry.browserContextForId(browserContextId).applySetting('scrollbarsHidden', nullToUndefined(hidden));
   }
 
-  async addBinding({browserContextId, name, script}) {
-    await this._targetRegistry.browserContextForId(browserContextId).addBinding(name, script);
+  async ['Browser.setInitScripts']({browserContextId, scripts}) {
+    await this._targetRegistry.browserContextForId(browserContextId).setInitScripts(scripts);
   }
 
-  setCookies({browserContextId, cookies}) {
+  async ['Browser.addBinding']({browserContextId, worldName, name, script}) {
+    await this._targetRegistry.browserContextForId(browserContextId).addBinding(worldName, name, script);
+  }
+
+  ['Browser.setCookies']({browserContextId, cookies}) {
     this._targetRegistry.browserContextForId(browserContextId).setCookies(cookies);
   }
 
-  clearCookies({browserContextId}) {
+  ['Browser.clearCookies']({browserContextId}) {
     this._targetRegistry.browserContextForId(browserContextId).clearCookies();
   }
 
-  getCookies({browserContextId}) {
+  ['Browser.getCookies']({browserContextId}) {
     const cookies = this._targetRegistry.browserContextForId(browserContextId).getCookies();
     return {cookies};
   }
 
-  async getInfo() {
-    const version = Components.classes["@mozilla.org/xre/app-info;1"]
-                              .getService(Components.interfaces.nsIXULAppInfo)
-                              .version;
+  async ['Browser.getInfo']() {
+    const version = AppConstants.MOZ_APP_VERSION_DISPLAY;
     const userAgent = Components.classes["@mozilla.org/network/protocol;1?name=http"]
                                 .getService(Components.interfaces.nsIHttpProtocolHandler)
                                 .userAgent;
     return {version: 'Firefox/' + version, userAgent};
   }
+}
+
+async function waitForWindowClosed(browserWindow) {
+  if (browserWindow.closed)
+    return;
+  await new Promise((resolve => {
+    const listener = {
+      onCloseWindow: window => {
+        let domWindow;
+        if (window instanceof Ci.nsIAppWindow)
+          domWindow = window.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowInternal || Ci.nsIDOMWindow);
+        else
+          domWindow = window;
+        if (domWindow === browserWindow) {
+          Services.wm.removeListener(listener);
+          resolve();
+        }
+      },
+    };
+    Services.wm.addListener(listener);
+  }));
 }
 
 function nullToUndefined(value) {

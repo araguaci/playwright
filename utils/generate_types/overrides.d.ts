@@ -13,44 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { Protocol } from './protocol';
 import { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import { Readable } from 'stream';
-
-/**
- * Can be converted to JSON
- */
-type Serializable = {};
-/**
- * Can be converted to JSON, but may also contain JSHandles.
- */
-type EvaluationArgument = {};
-
-type NoHandles<Arg> = Arg extends JSHandle ? never : (Arg extends object ? { [Key in keyof Arg]: NoHandles<Arg[Key]> } : Arg);
-type Unboxed<Arg> =
-  Arg extends ElementHandle<infer T> ? T :
-  Arg extends JSHandle<infer T> ? T :
-  Arg extends NoHandles<Arg> ? Arg :
-  Arg extends [infer A0] ? [Unboxed<A0>] :
-  Arg extends [infer A0, infer A1] ? [Unboxed<A0>, Unboxed<A1>] :
-  Arg extends [infer A0, infer A1, infer A2] ? [Unboxed<A0>, Unboxed<A1>, Unboxed<A2>] :
-  Arg extends [infer A0, infer A1, infer A2, infer A3] ? [Unboxed<A0>, Unboxed<A1>, Unboxed<A2>, Unboxed<A3>] :
-  Arg extends Array<infer T> ? Array<Unboxed<T>> :
-  Arg extends object ? { [Key in keyof Arg]: Unboxed<Arg[Key]> } :
-  Arg;
-type PageFunction<Arg, R> = string | ((arg: Unboxed<Arg>) => R | Promise<R>);
-type PageFunctionOn<On, Arg2, R> = string | ((on: On, arg2: Unboxed<Arg2>) => R | Promise<R>);
-type SmartHandle<T> = T extends Node ? ElementHandle<T> : JSHandle<T>;
-type ElementHandleForTag<K extends keyof HTMLElementTagNameMap> = ElementHandle<HTMLElementTagNameMap[K]>;
-type HTMLOrSVGElement = SVGElement | HTMLElement;
-type HTMLOrSVGElementHandle = ElementHandle<HTMLOrSVGElement>;
+import { ReadStream } from 'fs';
+import { Protocol } from './protocol';
+import { Serializable, EvaluationArgument, PageFunction, PageFunctionOn, SmartHandle, ElementHandleForTag, BindingSource } from './structs';
 
 type PageWaitForSelectorOptionsNotHidden = PageWaitForSelectorOptions & {
-  state: 'visible'|'attached';
+  state?: 'visible'|'attached';
 };
 type ElementHandleWaitForSelectorOptionsNotHidden = ElementHandleWaitForSelectorOptions & {
-  state: 'visible'|'attached';
+  state?: 'visible'|'attached';
 };
 
 export interface Page {
@@ -60,29 +34,34 @@ export interface Page {
   evaluateHandle<R, Arg>(pageFunction: PageFunction<Arg, R>, arg: Arg): Promise<SmartHandle<R>>;
   evaluateHandle<R>(pageFunction: PageFunction<void, R>, arg?: any): Promise<SmartHandle<R>>;
 
-  $<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K> | null>;
-  $(selector: string): Promise<HTMLOrSVGElementHandle | null>;
+  addInitScript<Arg>(script: PageFunction<Arg, any> | { path?: string, content?: string }, arg?: Arg): Promise<void>;
+
+  $<K extends keyof HTMLElementTagNameMap>(selector: K, options?: { strict: boolean }): Promise<ElementHandleForTag<K> | null>;
+  $(selector: string, options?: { strict: boolean }): Promise<ElementHandle<SVGElement | HTMLElement> | null>;
 
   $$<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K>[]>;
-  $$(selector: string): Promise<HTMLOrSVGElementHandle[]>;
+  $$(selector: string): Promise<ElementHandle<SVGElement | HTMLElement>[]>;
 
   $eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], Arg, R>, arg: Arg): Promise<R>;
-  $eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
+  $eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
   $eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], void, R>, arg?: any): Promise<R>;
-  $eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
+  $eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
 
   $$eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], Arg, R>, arg: Arg): Promise<R>;
-  $$eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
+  $$eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
   $$eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], void, R>, arg?: any): Promise<R>;
-  $$eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
+  $$eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
 
   waitForFunction<R, Arg>(pageFunction: PageFunction<Arg, R>, arg: Arg, options?: PageWaitForFunctionOptions): Promise<SmartHandle<R>>;
   waitForFunction<R>(pageFunction: PageFunction<void, R>, arg?: any, options?: PageWaitForFunctionOptions): Promise<SmartHandle<R>>;
 
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options?: PageWaitForSelectorOptionsNotHidden): Promise<ElementHandleForTag<K>>;
-  waitForSelector(selector: string, options?: PageWaitForSelectorOptionsNotHidden): Promise<HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options?: PageWaitForSelectorOptionsNotHidden): Promise<ElementHandle<SVGElement | HTMLElement>>;
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options: PageWaitForSelectorOptions): Promise<ElementHandleForTag<K> | null>;
-  waitForSelector(selector: string, options: PageWaitForSelectorOptions): Promise<null|HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options: PageWaitForSelectorOptions): Promise<null|ElementHandle<SVGElement | HTMLElement>>;
+
+  exposeBinding(name: string, playwrightBinding: (source: BindingSource, arg: JSHandle) => any, options: { handle: true }): Promise<void>;
+  exposeBinding(name: string, playwrightBinding: (source: BindingSource, ...args: any[]) => any, options?: { handle?: boolean }): Promise<void>;
 }
 
 export interface Frame {
@@ -92,29 +71,36 @@ export interface Frame {
   evaluateHandle<R, Arg>(pageFunction: PageFunction<Arg, R>, arg: Arg): Promise<SmartHandle<R>>;
   evaluateHandle<R>(pageFunction: PageFunction<void, R>, arg?: any): Promise<SmartHandle<R>>;
 
-  $<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K> | null>;
-  $(selector: string): Promise<HTMLOrSVGElementHandle | null>;
+  $<K extends keyof HTMLElementTagNameMap>(selector: K, options?: { strict: boolean }): Promise<ElementHandleForTag<K> | null>;
+  $(selector: string, options?: { strict: boolean }): Promise<ElementHandle<SVGElement | HTMLElement> | null>;
 
   $$<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K>[]>;
-  $$(selector: string): Promise<HTMLOrSVGElementHandle[]>;
+  $$(selector: string): Promise<ElementHandle<SVGElement | HTMLElement>[]>;
 
   $eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], Arg, R>, arg: Arg): Promise<R>;
-  $eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
+  $eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
   $eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], void, R>, arg?: any): Promise<R>;
-  $eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
+  $eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
 
   $$eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], Arg, R>, arg: Arg): Promise<R>;
-  $$eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
+  $$eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
   $$eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], void, R>, arg?: any): Promise<R>;
-  $$eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
+  $$eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
 
   waitForFunction<R, Arg>(pageFunction: PageFunction<Arg, R>, arg: Arg, options?: PageWaitForFunctionOptions): Promise<SmartHandle<R>>;
   waitForFunction<R>(pageFunction: PageFunction<void, R>, arg?: any, options?: PageWaitForFunctionOptions): Promise<SmartHandle<R>>;
 
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options?: PageWaitForSelectorOptionsNotHidden): Promise<ElementHandleForTag<K>>;
-  waitForSelector(selector: string, options?: PageWaitForSelectorOptionsNotHidden): Promise<HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options?: PageWaitForSelectorOptionsNotHidden): Promise<ElementHandle<SVGElement | HTMLElement>>;
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options: PageWaitForSelectorOptions): Promise<ElementHandleForTag<K> | null>;
-  waitForSelector(selector: string, options: PageWaitForSelectorOptions): Promise<null|HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options: PageWaitForSelectorOptions): Promise<null|ElementHandle<SVGElement | HTMLElement>>;
+}
+
+export interface BrowserContext {
+  exposeBinding(name: string, playwrightBinding: (source: BindingSource, arg: JSHandle) => any, options: { handle: true }): Promise<void>;
+  exposeBinding(name: string, playwrightBinding: (source: BindingSource, ...args: any[]) => any, options?: { handle?: boolean }): Promise<void>;
+
+  addInitScript<Arg>(script: PageFunction<Arg, any> | { path?: string, content?: string }, arg?: Arg): Promise<void>;
 }
 
 export interface Worker {
@@ -137,35 +123,59 @@ export interface JSHandle<T = any> {
 }
 
 export interface ElementHandle<T=Node> extends JSHandle<T> {
-  $<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K> | null>;
-  $(selector: string): Promise<HTMLOrSVGElementHandle | null>;
+  $<K extends keyof HTMLElementTagNameMap>(selector: K, options?: { strict: boolean }): Promise<ElementHandleForTag<K> | null>;
+  $(selector: string, options?: { strict: boolean }): Promise<ElementHandle<SVGElement | HTMLElement> | null>;
 
   $$<K extends keyof HTMLElementTagNameMap>(selector: K): Promise<ElementHandleForTag<K>[]>;
-  $$(selector: string): Promise<HTMLOrSVGElementHandle[]>;
+  $$(selector: string): Promise<ElementHandle<SVGElement | HTMLElement>[]>;
 
   $eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], Arg, R>, arg: Arg): Promise<R>;
-  $eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
+  $eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<R>;
   $eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K], void, R>, arg?: any): Promise<R>;
-  $eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
+  $eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E, void, R>, arg?: any): Promise<R>;
 
   $$eval<K extends keyof HTMLElementTagNameMap, R, Arg>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], Arg, R>, arg: Arg): Promise<R>;
-  $$eval<R, Arg, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
+  $$eval<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
   $$eval<K extends keyof HTMLElementTagNameMap, R>(selector: K, pageFunction: PageFunctionOn<HTMLElementTagNameMap[K][], void, R>, arg?: any): Promise<R>;
-  $$eval<R, E extends HTMLOrSVGElement = HTMLOrSVGElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
+  $$eval<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(selector: string, pageFunction: PageFunctionOn<E[], void, R>, arg?: any): Promise<R>;
 
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options?: ElementHandleWaitForSelectorOptionsNotHidden): Promise<ElementHandleForTag<K>>;
-  waitForSelector(selector: string, options?: ElementHandleWaitForSelectorOptionsNotHidden): Promise<HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options?: ElementHandleWaitForSelectorOptionsNotHidden): Promise<ElementHandle<SVGElement | HTMLElement>>;
   waitForSelector<K extends keyof HTMLElementTagNameMap>(selector: K, options: ElementHandleWaitForSelectorOptions): Promise<ElementHandleForTag<K> | null>;
-  waitForSelector(selector: string, options: ElementHandleWaitForSelectorOptions): Promise<null|HTMLOrSVGElementHandle>;
+  waitForSelector(selector: string, options: ElementHandleWaitForSelectorOptions): Promise<null|ElementHandle<SVGElement | HTMLElement>>;
 }
 
-export interface BrowserType<Browser> {
-
+export interface Locator {
+  evaluate<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg, options?: {
+    timeout?: number;
+  }): Promise<R>;
+  evaluate<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E, void, R>, options?: {
+    timeout?: number;
+  }): Promise<R>;
+  evaluateHandle<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E, Arg, R>, arg: Arg): Promise<SmartHandle<R>>;
+  evaluateHandle<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E, void, R>): Promise<SmartHandle<R>>;
+  evaluateAll<R, Arg, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E[], Arg, R>, arg: Arg): Promise<R>;
+  evaluateAll<R, E extends SVGElement | HTMLElement = SVGElement | HTMLElement>(pageFunction: PageFunctionOn<E[], void, R>): Promise<R>;
+  elementHandle(options?: {
+    timeout?: number;
+  }): Promise<null|ElementHandle<SVGElement | HTMLElement>>;
 }
 
-export interface ChromiumBrowser extends Browser {
-  contexts(): Array<ChromiumBrowserContext>;
-  newContext(options?: BrowserNewContextOptions): Promise<ChromiumBrowserContext>;
+export interface BrowserType<Unused = {}> {
+  connectOverCDP(endpointURL: string, options?: ConnectOverCDPOptions): Promise<Browser>;
+  /**
+   * Option `wsEndpoint` is deprecated. Instead use `endpointURL`.
+   * @deprecated
+   */
+  connectOverCDP(options: ConnectOverCDPOptions & { wsEndpoint?: string }): Promise<Browser>;
+  connect(wsEndpoint: string, options?: ConnectOptions): Promise<Browser>;
+  /**
+   * wsEndpoint in options is deprecated. Instead use `wsEndpoint`.
+   * @param wsEndpoint A browser websocket endpoint to connect to.
+   * @param options
+   * @deprecated
+   */
+  connect(options: ConnectOptions & { wsEndpoint?: string }): Promise<Browser>;
 }
 
 export interface CDPSession {
@@ -181,11 +191,12 @@ export interface CDPSession {
 }
 
 type DeviceDescriptor = {
-  viewport: BrowserNewContextOptionsViewport;
+  viewport: ViewportSize;
   userAgent: string;
   deviceScaleFactor: number;
   isMobile: boolean;
   hasTouch: boolean;
+  defaultBrowserType: 'chromium' | 'firefox' | 'webkit';
 };
 
 export namespace errors {
@@ -194,8 +205,142 @@ class TimeoutError extends Error {}
 
 }
 
-export const selectors: Selectors;
-export const devices: Devices & DeviceDescriptor[];
+export interface Accessibility {
+  snapshot(options?: AccessibilitySnapshotOptions): Promise<null|AccessibilityNode>;
+}
+
+type AccessibilityNode = {
+  role: string;
+  name: string;
+  value?: string|number;
+  description?: string;
+  keyshortcuts?: string;
+  roledescription?: string;
+  valuetext?: string;
+  disabled?: boolean;
+  expanded?: boolean;
+  focused?: boolean;
+  modal?: boolean;
+  multiline?: boolean;
+  multiselectable?: boolean;
+  readonly?: boolean;
+  required?: boolean;
+  selected?: boolean;
+  checked?: boolean|"mixed";
+  pressed?: boolean|"mixed";
+  level?: number;
+  valuemin?: number;
+  valuemax?: number;
+  autocomplete?: string;
+  haspopup?: string;
+  invalid?: string;
+  orientation?: string;
+  children?: AccessibilityNode[];
+}
+
+export const devices: Devices;
+
+//@ts-ignore this will be any if electron is not installed
+type ElectronType = typeof import('electron');
+
+export interface ElectronApplication {
+  evaluate<R, Arg>(pageFunction: PageFunctionOn<ElectronType, Arg, R>, arg: Arg): Promise<R>;
+  evaluate<R>(pageFunction: PageFunctionOn<ElectronType, void, R>, arg?: any): Promise<R>;
+
+  evaluateHandle<R, Arg>(pageFunction: PageFunctionOn<ElectronType, Arg, R>, arg: Arg): Promise<SmartHandle<R>>;
+  evaluateHandle<R>(pageFunction: PageFunctionOn<ElectronType, void, R>, arg?: any): Promise<SmartHandle<R>>;
+}
+
+export type AndroidElementInfo = {
+  clazz: string;
+  desc: string;
+  res: string;
+  pkg: string;
+  text: string;
+  bounds: { x: number, y: number, width: number, height: number };
+  checkable: boolean;
+  checked: boolean;
+  clickable: boolean;
+  enabled: boolean;
+  focusable: boolean;
+  focused: boolean;
+  longClickable: boolean;
+  scrollable: boolean;
+  selected: boolean;
+};
+
+export type AndroidSelector = {
+  checkable?: boolean,
+  checked?: boolean,
+  clazz?: string | RegExp,
+  clickable?: boolean,
+  depth?: number,
+  desc?: string | RegExp,
+  enabled?: boolean,
+  focusable?: boolean,
+  focused?: boolean,
+  hasChild?: { selector: AndroidSelector },
+  hasDescendant?: { selector: AndroidSelector, maxDepth?: number },
+  longClickable?: boolean,
+  pkg?: string | RegExp,
+  res?: string | RegExp,
+  scrollable?: boolean,
+  selected?: boolean,
+  text?: string | RegExp,
+};
+
+export type AndroidKey =
+  'Unknown' |
+  'SoftLeft' | 'SoftRight' |
+  'Home' |
+  'Back' |
+  'Call' | 'EndCall' |
+  '0' |  '1' |  '2' |  '3' |  '4' |  '5' |  '6' |  '7' |  '8' |  '9' |
+  'Star' | 'Pound' | '*' | '#' |
+  'DialUp' | 'DialDown' | 'DialLeft' | 'DialRight' | 'DialCenter' |
+  'VolumeUp' | 'VolumeDown' |
+  'Power' |
+  'Camera' |
+  'Clear' |
+  'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'J' | 'K' | 'L' | 'M' |
+  'N' | 'O' | 'P' | 'Q' | 'R' | 'S' | 'T' | 'U' | 'V' | 'W' | 'X' | 'Y' | 'Z' |
+  'Comma' | ',' |
+  'Period' | '.' |
+  'AltLeft' | 'AltRight' |
+  'ShiftLeft' | 'ShiftRight' |
+  'Tab' | '\t' |
+  'Space' | ' ' |
+  'Sym' |
+  'Explorer' |
+  'Envelop' |
+  'Enter' | '\n' |
+  'Del' |
+  'Grave' |
+  'Minus' | '-' |
+  'Equals' | '=' |
+  'LeftBracket' | '(' |
+  'RightBracket' | ')' |
+  'Backslash' | '\\' |
+  'Semicolon' | ';' |
+  'Apostrophe' | '`' |
+  'Slash' | '/' |
+  'At' | '@' |
+  'Num' |
+  'HeadsetHook' |
+  'Focus' |
+  'Plus' | '+' |
+  'Menu' |
+  'Notification' |
+  'Search' |
+  'RecentApps' |
+  'AppSwitch' |
+  'Assist' |
+  'Cut' |
+  'Copy' |
+  'Paste';
+
+export const _electron: Electron;
+export const _android: Android;
 
 // This is required to not export everything by default. See https://github.com/Microsoft/TypeScript/issues/19545#issuecomment-340490459
 export {};

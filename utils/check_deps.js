@@ -16,62 +16,204 @@
  * limitations under the License.
  */
 
+// @ts-check
+
+const fs = require('fs');
 const ts = require('typescript');
-const path = require('path');
-const Source = require('./doclint/Source');
+const path = require('path').posix;
+const Module = require('module');
+const builtins = new Set(Module.builtinModules);
+const packagesDir = path.resolve(path.join(__dirname, '..', 'packages'));
+
+const packages = new Map();
+packages.set('web', packagesDir + '/web/src/');
+packages.set('injected', packagesDir + '/playwright-core/src/server/injected/');
+packages.set('isomorphic', packagesDir + '/playwright-core/src/utils/isomorphic/');
+packages.set('testIsomorphic', packagesDir + '/playwright/src/isomorphic/');
+
+const peerDependencies = ['electron', 'react', 'react-dom', '@zip.js/zip.js'];
+
+const depsCache = {};
 
 async function checkDeps() {
-  const root = path.normalize(path.join(__dirname, '..'));
-  const src = path.normalize(path.join(__dirname, '..', 'src'));
-  const sources = await Source.readdir(src);
+  await innerCheckDeps(path.join(packagesDir, 'html-reporter'));
+  await innerCheckDeps(path.join(packagesDir, 'playwright-ct-core'));
+  await innerCheckDeps(path.join(packagesDir, 'protocol'));
+  await innerCheckDeps(path.join(packagesDir, 'recorder'));
+  await innerCheckDeps(path.join(packagesDir, 'trace-viewer'));
+  await innerCheckDeps(path.join(packagesDir, 'trace'));
+  await innerCheckDeps(path.join(packagesDir, 'web'));
+
+  const corePackageJson = await innerCheckDeps(path.join(packagesDir, 'playwright-core'));
+  const playwrightPackageJson = await innerCheckDeps(path.join(packagesDir, 'playwright'));
+
+  let hasVersionMismatch = false;
+  for (const [key, value] of Object.entries(corePackageJson.dependencies || {})) {
+    const value2 = playwrightPackageJson.dependencies[key];
+    if (value2 && value2 !== value) {
+      hasVersionMismatch = true;
+      console.log(`Dependency version mismatch ${key}: ${value} != ${value2}`);
+    }
+  }
+  process.exit(hasVersionMismatch ? 1 : 0);
+}
+
+async function innerCheckDeps(root) {
+  console.log('Checking DEPS for ' + path.relative(packagesDir, root));
+  const deps = new Set();
+  const src = path.join(root, 'src');
+
+  let packageJSON;
+  try {
+    packageJSON = require(path.resolve(path.join(root, 'package.json')));
+  } catch {
+  }
+
   const program = ts.createProgram({
     options: {
       allowJs: true,
       target: ts.ScriptTarget.ESNext,
       strict: true,
     },
-    rootNames: sources.map(source => source.filePath()),
+    rootNames: listAllFiles(src),
   });
   const sourceFiles = program.getSourceFiles();
   const errors = [];
-  sourceFiles.filter(x => !x.fileName.includes('node_modules')).map(x => visit(x, x.fileName));
-  for (const error of errors)
-    console.log(error);
+  sourceFiles.filter(x => !x.fileName.includes('node_modules')).map(x => visit(x, x.fileName, x.getFullText()));
+
   if (errors.length) {
+    for (const error of errors)
+      console.log(error);
     console.log(`--------------------------------------------------------`);
     console.log(`Changing the project structure or adding new components?`);
-    console.log(`Update DEPS in //${path.relative(root, __filename)}.`);
+    console.log(`Update DEPS in ${root}`);
     console.log(`--------------------------------------------------------`);
+    process.exit(1);
   }
-  process.exit(errors.length ? 1 : 0);
 
-  function visit(node, fileName) {
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      const importName = node.moduleSpecifier.text;
-      const importPath = path.resolve(path.dirname(fileName), importName) + '.ts';
-      if (!allowImport(fileName, importPath))
-        errors.push(`Disallowed import from ${path.relative(root, fileName)} to ${path.relative(root, importPath)}`);
+  if (packageJSON) {
+    for (const dep of peerDependencies)
+      deps.delete(dep);
+    for (const dep of deps) {
+      const resolved = require.resolve(dep, { paths: [root] });
+      if (dep === resolved || !resolved.includes('node_modules'))
+        deps.delete(dep);
     }
-    ts.forEachChild(node, x => visit(x, fileName));
+    for (const dep of Object.keys(packageJSON.dependencies || {}))
+      deps.delete(dep);
+
+    if (deps.size) {
+      console.log('Dependencies are not declared in package.json:');
+      for (const dep of deps)
+        console.log(`  ${dep}`);
+      process.exit(1);
+    }
   }
 
-  function allowImport(from, to) {
-    from = from.substring(from.indexOf('src' + path.sep)).replace(/\\/g, '/');
-    to = to.substring(to.indexOf('src' + path.sep)).replace(/\\/g, '/');
-    const fromDirectory = from.substring(0, from.lastIndexOf('/') + 1);
-    const toDirectory = to.substring(0, to.lastIndexOf('/') + 1);
+  return packageJSON;
+
+  function visit(node, fileName, text) {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      if (node.importClause) {
+        if (node.importClause.isTypeOnly)
+          return;
+        if (node.importClause.namedBindings && ts.isNamedImports(node.importClause.namedBindings)) {
+          if (node.importClause.namedBindings.elements.every(e => e.isTypeOnly))
+            return;
+        }
+      }
+      const importName = node.moduleSpecifier.text;
+      let importPath;
+      if (importName.startsWith('.')) {
+        importPath = path.resolve(path.dirname(fileName), importName);
+      } else if (importName.startsWith('@')) {
+        const tokens = importName.substring(1).split('/');
+        const package = tokens[0];
+        if (packages.has(package))
+          importPath = packages.get(package) + tokens.slice(1).join('/');
+      }
+
+      const mergedDeps = calculateDeps(fileName);
+      if (mergedDeps.includes('***'))
+        return;
+      if (importPath) {
+        if (!fs.existsSync(importPath)) {
+          if (fs.existsSync(importPath + '.ts'))
+            importPath = importPath + '.ts';
+          else if (fs.existsSync(importPath + '.tsx'))
+            importPath = importPath + '.tsx';
+          else if (fs.existsSync(importPath + '.d.ts'))
+            importPath = importPath + '.d.ts';
+        }
+
+        if (!allowImport(fileName, importPath, mergedDeps))
+          errors.push(`Disallowed import ${path.relative(root, importPath)} in ${path.relative(root, fileName)}`);
+        return;
+      }
+
+      const fullStart = node.getFullStart();
+      const commentRanges = ts.getLeadingCommentRanges(text, fullStart);
+      for (const range of commentRanges || []) {
+          const comment = text.substring(range.pos, range.end);
+          if (comment.includes('@no-check-deps'))
+            return;
+      }
+
+      if (importName.startsWith('@'))
+        deps.add(importName.split('/').slice(0, 2).join('/'));
+      else
+        deps.add(importName.split('/')[0]);
+
+      if (!allowExternalImport(importName, packageJSON))
+        errors.push(`Disallowed external dependency ${importName} from ${path.relative(root, fileName)}`);
+    }
+    ts.forEachChild(node, x => visit(x, fileName, text));
+  }
+
+  function calculateDeps(from) {
+    const fromDirectory = path.dirname(from);
+    let depsDirectory = fromDirectory;
+    while (depsDirectory.startsWith(packagesDir) && !depsCache[depsDirectory] && !fs.existsSync(path.join(depsDirectory, 'DEPS.list')))
+      depsDirectory = path.dirname(depsDirectory);
+    if (!depsDirectory.startsWith(packagesDir))
+      return [];
+
+    let deps = depsCache[depsDirectory];
+    if (!deps) {
+      const depsListFile = path.join(depsDirectory, 'DEPS.list');
+      deps = {};
+      let group = [];
+      for (const line of fs.readFileSync(depsListFile, 'utf-8').split('\n').filter(Boolean).filter(l => !l.startsWith('#'))) {
+        const groupMatch = line.match(/\[(.*)\]/);
+        if (groupMatch) {
+          group = [];
+          deps[groupMatch[1]] = group;
+          continue;
+        }
+        if (line === '***')
+          group.push('***');
+        else if (line.startsWith('@'))
+          group.push(line.replace(/@([\w-]+)\/(.*)/, (_, arg1, arg2) => packages.get(arg1) + arg2));
+        else
+          group.push(path.resolve(depsDirectory, line));
+      }
+      depsCache[depsDirectory] = deps;
+    }
+
+    return [...(deps['*'] || []), ...(deps[path.relative(depsDirectory, from)] || [])]
+  }
+
+  function allowImport(from, to, mergedDeps) {
+    const fromDirectory = path.dirname(from);
+    const toDirectory = isDirectory(to) ? to : path.dirname(to);
+    if (to === toDirectory)
+      to = path.join(to, 'index.ts');
     if (fromDirectory === toDirectory)
       return true;
 
-    while (!DEPS[from]) {
-      if (from.endsWith('/'))
-        from = from.substring(0, from.length - 1);
-      if (from.lastIndexOf('/') === -1)
-        throw new Error(`Cannot find DEPS for ${fromDirectory}`);
-      from = from.substring(0, from.lastIndexOf('/') + 1);
-    }
-
-    for (const dep of DEPS[from]) {
+    for (const dep of mergedDeps) {
+      if (dep === '***')
+        return true;
       if (to === dep || toDirectory === dep)
         return true;
       if (dep.endsWith('**')) {
@@ -82,39 +224,41 @@ async function checkDeps() {
     }
     return false;
   }
+
+  function allowExternalImport(importName, packageJSON) {
+    // Only external imports are relevant. Files in src/web are bundled via webpack.
+    if (importName.startsWith('.') || (importName.startsWith('@') && !importName.startsWith('@playwright/')))
+      return true;
+    if (peerDependencies.includes(importName))
+      return true;
+    if (!packageJSON)
+      return false;
+    const match = importName.match(/(@[\w-]+\/)?([^/]+)/);
+    const dependency = match[1] ? match[1] + match[2] : match[2];
+    if (builtins.has(dependency))
+      return true;
+    return !!(packageJSON.dependencies || {})[dependency];
+  }
 }
 
-const DEPS = {};
+function listAllFiles(dir) {
+  const dirs = fs.readdirSync(dir, { withFileTypes: true });
+  const result = [];
+  dirs.map(d => {
+    const res = path.resolve(dir, d.name);
+    if (d.isDirectory())
+      result.push(...listAllFiles(res));
+    else
+      result.push(res);
+  });
+  return result;
+}
 
-DEPS['src/protocol/'] = ['src/utils/'];
-DEPS['src/install/'] = ['src/utils/'];
+checkDeps().catch(e => {
+  console.error(e && e.stack ? e.stack : e);
+  process.exit(1);
+});
 
-// Client depends on chromium protocol for types.
-DEPS['src/client/'] = ['src/utils/', 'src/protocol/', 'src/server/chromium/protocol.ts'];
-
-DEPS['src/dispatchers/'] = ['src/utils/', 'src/protocol/', 'src/server/**'];
-
-// Generic dependencies for server-side code.
-DEPS['src/server/'] = [
-  'src/utils/',
-  'src/generated/',
-  // Can depend on files directly in the server directory.
-  'src/server/',
-  // Can depend on any files in these subdirectories.
-  'src/server/common/**',
-  'src/server/injected/**',
-  'src/server/debug/**',
-];
-
-// No dependencies for code shared between node and page.
-DEPS['src/server/common/'] = [];
-// Strict dependencies for injected code.
-DEPS['src/server/injected/'] = ['src/server/common/'];
-
-// Electron uses chromium internally.
-DEPS['src/server/electron/'] = [...DEPS['src/server/'], 'src/server/chromium/'];
-
-DEPS['src/server/playwright.ts'] = [...DEPS['src/server/'], 'src/server/chromium/', 'src/server/webkit/', 'src/server/firefox/'];
-DEPS['src/server.ts'] = DEPS['src/inprocess.ts'] = DEPS['src/browserServerImpl.ts'] = ['src/**'];
-
-checkDeps();
+function isDirectory(dir) {
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+}

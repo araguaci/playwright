@@ -3,13 +3,15 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 "use strict";
-const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
+
 const Ci = Components.interfaces;
 const Cr = Components.results;
 const Cu = Components.utils;
 
 const {Helper} = ChromeUtils.import('chrome://juggler/content/Helper.js');
 const {NetUtil} = ChromeUtils.import('resource://gre/modules/NetUtil.jsm');
+const {setTimeout} = ChromeUtils.import('resource://gre/modules/Timer.jsm');
+
 const dragService = Cc["@mozilla.org/widget/dragservice;1"].getService(
   Ci.nsIDragService
 );
@@ -20,205 +22,47 @@ const obs = Cc["@mozilla.org/observer-service;1"].getService(
 const helper = new Helper();
 
 class WorkerData {
-  constructor(pageAgent, browserChannel, sessionId, worker) {
-    this._workerRuntime = worker.channel().connect(sessionId + 'runtime');
-    this._browserWorker = browserChannel.connect(sessionId + worker.id());
+  constructor(pageAgent, browserChannel, worker) {
+    this._workerRuntime = worker.channel().connect('runtime');
+    this._browserWorker = browserChannel.connect(worker.id());
     this._worker = worker;
-    this._sessionId = sessionId;
     const emit = name => {
       return (...args) => this._browserWorker.emit(name, ...args);
     };
     this._eventListeners = [
-      worker.channel().register(sessionId + 'runtime', {
+      worker.channel().register('runtime', {
         runtimeConsole: emit('runtimeConsole'),
         runtimeExecutionContextCreated: emit('runtimeExecutionContextCreated'),
         runtimeExecutionContextDestroyed: emit('runtimeExecutionContextDestroyed'),
       }),
-      browserChannel.register(sessionId + worker.id(), {
+      browserChannel.register(worker.id(), {
         evaluate: (options) => this._workerRuntime.send('evaluate', options),
         callFunction: (options) => this._workerRuntime.send('callFunction', options),
         getObjectProperties: (options) => this._workerRuntime.send('getObjectProperties', options),
-        disposeObject: (options) =>this._workerRuntime.send('disposeObject', options),
+        disposeObject: (options) => this._workerRuntime.send('disposeObject', options),
       }),
     ];
-    worker.channel().connect('').emit('attach', {sessionId});
   }
 
   dispose() {
-    this._worker.channel().connect('').emit('detach', {sessionId: this._sessionId});
     this._workerRuntime.dispose();
     this._browserWorker.dispose();
     helper.removeListeners(this._eventListeners);
   }
 }
 
-class FrameData {
-  constructor(agent, runtime, frame) {
-    this._agent = agent;
-    this._runtime = runtime;
-    this._frame = frame;
-    this._isolatedWorlds = new Map();
-    this._initialNavigationDone = false;
-    this.reset();
-  }
-
-  reset() {
-    for (const world of this._isolatedWorlds.values())
-      this._runtime.destroyExecutionContext(world);
-    this._isolatedWorlds.clear();
-
-    for (const {script, worldName} of this._agent._isolatedWorlds.values()) {
-      const context = worldName ? this.createIsolatedWorld(worldName) : this._frame.executionContext();
-      try {
-        let result = context.evaluateScript(script);
-        if (result && result.objectId)
-          context.disposeObject(result.objectId);
-      } catch (e) {
-      }
-    }
-  }
-
-  createIsolatedWorld(name) {
-    const principal = [this._frame.domWindow()]; // extended principal
-    const sandbox = Cu.Sandbox(principal, {
-      sandboxPrototype: this._frame.domWindow(),
-      wantComponents: false,
-      wantExportHelpers: false,
-      wantXrays: true,
-    });
-    const world = this._runtime.createExecutionContext(this._frame.domWindow(), sandbox, {
-      frameId: this._frame.id(),
-      name,
-    });
-    this._isolatedWorlds.set(world.id(), world);
-    return world;
-  }
-
-  unsafeObject(objectId) {
-    const contexts = [this._frame.executionContext(), ...this._isolatedWorlds.values()];
-    for (const context of contexts) {
-      const result = context.unsafeObject(objectId);
-      if (result)
-        return result.object;
-    }
-    throw new Error('Cannot find object with id = ' + objectId);
-  }
-
-  dispose() {
-    for (const world of this._isolatedWorlds.values())
-      this._runtime.destroyExecutionContext(world);
-    this._isolatedWorlds.clear();
-  }
-}
-
 class PageAgent {
-  constructor(messageManager, browserChannel, sessionId, frameTree, networkMonitor) {
-    this._messageManager = messageManager;
+  constructor(browserChannel, frameTree) {
     this._browserChannel = browserChannel;
-    this._sessionId = sessionId;
-    this._browserPage = browserChannel.connect(sessionId + 'page');
-    this._browserRuntime = browserChannel.connect(sessionId + 'runtime');
+    this._browserPage = browserChannel.connect('page');
     this._frameTree = frameTree;
     this._runtime = frameTree.runtime();
-    this._networkMonitor = networkMonitor;
 
-    this._frameData = new Map();
     this._workerData = new Map();
-    this._scriptsToEvaluateOnNewDocument = new Map();
-    this._isolatedWorlds = new Map();
-
-    this._eventListeners = [
-      browserChannel.register(sessionId + 'page', {
-        addBinding: ({ name, script }) => this._frameTree.addBinding(name, script),
-        addScriptToEvaluateOnNewDocument: this._addScriptToEvaluateOnNewDocument.bind(this),
-        adoptNode: this._adoptNode.bind(this),
-        crash: this._crash.bind(this),
-        describeNode: this._describeNode.bind(this),
-        dispatchKeyEvent: this._dispatchKeyEvent.bind(this),
-        dispatchMouseEvent: this._dispatchMouseEvent.bind(this),
-        dispatchTouchEvent: this._dispatchTouchEvent.bind(this),
-        getBoundingBox: this._getBoundingBox.bind(this),
-        getContentQuads: this._getContentQuads.bind(this),
-        getFullAXTree: this._getFullAXTree.bind(this),
-        goBack: this._goBack.bind(this),
-        goForward: this._goForward.bind(this),
-        insertText: this._insertText.bind(this),
-        navigate: this._navigate.bind(this),
-        reload: this._reload.bind(this),
-        removeScriptToEvaluateOnNewDocument: this._removeScriptToEvaluateOnNewDocument.bind(this),
-        requestDetails: this._requestDetails.bind(this),
-        screenshot: this._screenshot.bind(this),
-        scrollIntoViewIfNeeded: this._scrollIntoViewIfNeeded.bind(this),
-        setCacheDisabled: this._setCacheDisabled.bind(this),
-        setEmulatedMedia: this._setEmulatedMedia.bind(this),
-        setFileInputFiles: this._setFileInputFiles.bind(this),
-        setInterceptFileChooserDialog: this._setInterceptFileChooserDialog.bind(this),
-      }),
-      browserChannel.register(sessionId + 'runtime', {
-        evaluate: this._runtime.evaluate.bind(this._runtime),
-        callFunction: this._runtime.callFunction.bind(this._runtime),
-        getObjectProperties: this._runtime.getObjectProperties.bind(this._runtime),
-        disposeObject: this._runtime.disposeObject.bind(this._runtime),
-      }),
-    ];
-    this._enabled = false;
 
     const docShell = frameTree.mainFrame().docShell();
     this._docShell = docShell;
-    this._initialDPPX = docShell.contentViewer.overrideDPPX;
-    this._customScrollbars = null;
-    this._dataTransfer = null;
-  }
 
-  _requestDetails({channelId}) {
-    return this._networkMonitor.requestDetails(channelId);
-  }
-
-  async _setEmulatedMedia({type, colorScheme}) {
-    const docShell = this._frameTree.mainFrame().docShell();
-    const cv = docShell.contentViewer;
-    if (type === '')
-      cv.stopEmulatingMedium();
-    else if (type)
-      cv.emulateMedium(type);
-    this._frameTree.setColorScheme(colorScheme);
-  }
-
-  _addScriptToEvaluateOnNewDocument({script, worldName}) {
-    if (worldName)
-      return this._createIsolatedWorld({script, worldName});
-    return {scriptId: this._frameTree.addScriptToEvaluateOnNewDocument(script)};
-  }
-
-  _createIsolatedWorld({script, worldName}) {
-    const scriptId = helper.generateId();
-    this._isolatedWorlds.set(scriptId, {script, worldName});
-    for (const frameData of this._frameData.values())
-      frameData.createIsolatedWorld(worldName);
-    return {scriptId};
-  }
-
-  _removeScriptToEvaluateOnNewDocument({scriptId}) {
-    if (this._isolatedWorlds.has(scriptId))
-      this._isolatedWorlds.delete(scriptId);
-    else
-      this._frameTree.removeScriptToEvaluateOnNewDocument(scriptId);
-  }
-
-  _setCacheDisabled({cacheDisabled}) {
-    const enable = Ci.nsIRequest.LOAD_NORMAL;
-    const disable = Ci.nsIRequest.LOAD_BYPASS_CACHE |
-                  Ci.nsIRequest.INHIBIT_CACHING;
-
-    const docShell = this._frameTree.mainFrame().docShell();
-    docShell.defaultLoadFlags = cacheDisabled ? disable : enable;
-  }
-
-  enable() {
-    if (this._enabled)
-      return;
-
-    this._enabled = true;
     // Dispatch frameAttached events for all initial frames
     for (const frame of this._frameTree.frames()) {
       this._onFrameAttached(frame);
@@ -228,44 +72,12 @@ class PageAgent {
         this._onNavigationStarted(frame);
     }
 
+    // Report created workers.
     for (const worker of this._frameTree.workers())
       this._onWorkerCreated(worker);
 
-    this._eventListeners.push(...[
-      helper.addObserver(this._linkClicked.bind(this, false), 'juggler-link-click'),
-      helper.addObserver(this._linkClicked.bind(this, true), 'juggler-link-click-sync'),
-      helper.addObserver(this._onWindowOpenInNewContext.bind(this), 'juggler-window-open-in-new-context'),
-      helper.addObserver(this._filePickerShown.bind(this), 'juggler-file-picker-shown'),
-      helper.addEventListener(this._messageManager, 'DOMContentLoaded', this._onDOMContentLoaded.bind(this)),
-      helper.addEventListener(this._messageManager, 'pageshow', this._onLoad.bind(this)),
-      helper.addObserver(this._onDocumentOpenLoad.bind(this), 'juggler-document-open-loaded'),
-      helper.addEventListener(this._messageManager, 'error', this._onError.bind(this)),
-      helper.on(this._frameTree, 'bindingcalled', this._onBindingCalled.bind(this)),
-      helper.on(this._frameTree, 'frameattached', this._onFrameAttached.bind(this)),
-      helper.on(this._frameTree, 'framedetached', this._onFrameDetached.bind(this)),
-      helper.on(this._frameTree, 'globalobjectcreated', this._onGlobalObjectCreated.bind(this)),
-      helper.on(this._frameTree, 'navigationstarted', this._onNavigationStarted.bind(this)),
-      helper.on(this._frameTree, 'navigationcommitted', this._onNavigationCommitted.bind(this)),
-      helper.on(this._frameTree, 'navigationaborted', this._onNavigationAborted.bind(this)),
-      helper.on(this._frameTree, 'samedocumentnavigation', this._onSameDocumentNavigation.bind(this)),
-      helper.on(this._frameTree, 'pageready', () => this._browserPage.emit('pageReady', {})),
-      helper.on(this._frameTree, 'workercreated', this._onWorkerCreated.bind(this)),
-      helper.on(this._frameTree, 'workerdestroyed', this._onWorkerDestroyed.bind(this)),
-      helper.addObserver(this._onWindowOpen.bind(this), 'webNavigation-createdNavigationTarget-from-js'),
-      this._runtime.events.onErrorFromWorker((domWindow, message, stack) => {
-        const frame = this._frameTree.frameForDocShell(domWindow.docShell);
-        if (!frame)
-          return;
-        this._browserPage.emit('pageUncaughtError', {
-          frameId: frame.id(),
-          message,
-          stack,
-        });
-      }),
-      this._runtime.events.onConsoleMessage(msg => this._browserRuntime.emit('runtimeConsole', msg)),
-      this._runtime.events.onExecutionContextCreated(this._onExecutionContextCreated.bind(this)),
-      this._runtime.events.onExecutionContextDestroyed(this._onExecutionContextDestroyed.bind(this)),
-    ]);
+    // Report execution contexts.
+    this._browserPage.emit('runtimeExecutionContextsCleared', {});
     for (const context of this._runtime.executionContexts())
       this._onExecutionContextCreated(context);
 
@@ -281,6 +93,82 @@ class PageAgent {
       if (mainFrame.url() === 'about:blank' && readyState === 'complete')
         this._emitAllEvents(this._frameTree.mainFrame());
     }
+
+    this._eventListeners = [
+      helper.addObserver(this._linkClicked.bind(this, false), 'juggler-link-click'),
+      helper.addObserver(this._linkClicked.bind(this, true), 'juggler-link-click-sync'),
+      helper.addObserver(this._onWindowOpenInNewContext.bind(this), 'juggler-window-open-in-new-context'),
+      helper.addObserver(this._filePickerShown.bind(this), 'juggler-file-picker-shown'),
+      helper.addObserver(this._onDocumentOpenLoad.bind(this), 'juggler-document-open-loaded'),
+      helper.on(this._frameTree, 'frameattached', this._onFrameAttached.bind(this)),
+      helper.on(this._frameTree, 'framedetached', this._onFrameDetached.bind(this)),
+      helper.on(this._frameTree, 'navigationstarted', this._onNavigationStarted.bind(this)),
+      helper.on(this._frameTree, 'navigationcommitted', this._onNavigationCommitted.bind(this)),
+      helper.on(this._frameTree, 'navigationaborted', this._onNavigationAborted.bind(this)),
+      helper.on(this._frameTree, 'samedocumentnavigation', this._onSameDocumentNavigation.bind(this)),
+      helper.on(this._frameTree, 'pageready', () => this._browserPage.emit('pageReady', {})),
+      helper.on(this._frameTree, 'workercreated', this._onWorkerCreated.bind(this)),
+      helper.on(this._frameTree, 'workerdestroyed', this._onWorkerDestroyed.bind(this)),
+      helper.on(this._frameTree, 'websocketcreated', event => this._browserPage.emit('webSocketCreated', event)),
+      helper.on(this._frameTree, 'websocketopened', event => this._browserPage.emit('webSocketOpened', event)),
+      helper.on(this._frameTree, 'websocketframesent', event => this._browserPage.emit('webSocketFrameSent', event)),
+      helper.on(this._frameTree, 'websocketframereceived', event => this._browserPage.emit('webSocketFrameReceived', event)),
+      helper.on(this._frameTree, 'websocketclosed', event => this._browserPage.emit('webSocketClosed', event)),
+      helper.on(this._frameTree, 'inputevent', inputEvent => {
+        this._browserPage.emit('pageInputEvent', inputEvent);
+        if (inputEvent.type === 'dragstart') {
+          // After the dragStart event is dispatched and handled by Web,
+          // it might or might not create a new drag session, depending on its preventing default.
+          setTimeout(() => {
+            this._browserPage.emit('pageInputEvent', { type: 'juggler-drag-finalized', dragSessionStarted: !!dragService.getCurrentSession() });
+          }, 0);
+        }
+      }),
+      helper.addObserver(this._onWindowOpen.bind(this), 'webNavigation-createdNavigationTarget-from-js'),
+      this._runtime.events.onErrorFromWorker((domWindow, message, stack) => {
+        const frame = this._frameTree.frameForDocShell(domWindow.docShell);
+        if (!frame)
+          return;
+        this._browserPage.emit('pageUncaughtError', {
+          frameId: frame.id(),
+          message,
+          stack,
+        });
+      }),
+      this._runtime.events.onConsoleMessage(msg => this._browserPage.emit('runtimeConsole', msg)),
+      this._runtime.events.onRuntimeError(this._onRuntimeError.bind(this)),
+      this._runtime.events.onExecutionContextCreated(this._onExecutionContextCreated.bind(this)),
+      this._runtime.events.onExecutionContextDestroyed(this._onExecutionContextDestroyed.bind(this)),
+      this._runtime.events.onBindingCalled(this._onBindingCalled.bind(this)),
+      browserChannel.register('page', {
+        adoptNode: this._adoptNode.bind(this),
+        crash: this._crash.bind(this),
+        describeNode: this._describeNode.bind(this),
+        dispatchKeyEvent: this._dispatchKeyEvent.bind(this),
+        dispatchDragEvent: this._dispatchDragEvent.bind(this),
+        dispatchTouchEvent: this._dispatchTouchEvent.bind(this),
+        dispatchTapEvent: this._dispatchTapEvent.bind(this),
+        getContentQuads: this._getContentQuads.bind(this),
+        getFullAXTree: this._getFullAXTree.bind(this),
+        insertText: this._insertText.bind(this),
+        scrollIntoViewIfNeeded: this._scrollIntoViewIfNeeded.bind(this),
+        setCacheDisabled: this._setCacheDisabled.bind(this),
+        setFileInputFiles: this._setFileInputFiles.bind(this),
+        evaluate: this._runtime.evaluate.bind(this._runtime),
+        callFunction: this._runtime.callFunction.bind(this._runtime),
+        getObjectProperties: this._runtime.getObjectProperties.bind(this._runtime),
+        disposeObject: this._runtime.disposeObject.bind(this._runtime),
+      }),
+    ];
+  }
+
+  _setCacheDisabled({cacheDisabled}) {
+    const enable = Ci.nsIRequest.LOAD_NORMAL;
+    const disable = Ci.nsIRequest.LOAD_BYPASS_CACHE |
+                  Ci.nsIRequest.INHIBIT_CACHING;
+
+    const docShell = this._frameTree.mainFrame().docShell();
+    docShell.defaultLoadFlags = cacheDisabled ? disable : enable;
   }
 
   _emitAllEvents(frame) {
@@ -295,20 +183,20 @@ class PageAgent {
   }
 
   _onExecutionContextCreated(executionContext) {
-    this._browserRuntime.emit('runtimeExecutionContextCreated', {
+    this._browserPage.emit('runtimeExecutionContextCreated', {
       executionContextId: executionContext.id(),
       auxData: executionContext.auxData(),
     });
   }
 
   _onExecutionContextDestroyed(executionContext) {
-    this._browserRuntime.emit('runtimeExecutionContextDestroyed', {
+    this._browserPage.emit('runtimeExecutionContextDestroyed', {
       executionContextId: executionContext.id(),
     });
   }
 
   _onWorkerCreated(worker) {
-    const workerData = new WorkerData(this, this._browserChannel, this._sessionId, worker);
+    const workerData = new WorkerData(this, this._browserChannel, worker);
     this._workerData.set(worker.id(), workerData);
     this._browserPage.emit('pageWorkerCreated', {
       workerId: worker.id(),
@@ -338,10 +226,6 @@ class PageAgent {
       this._emitAllEvents(this._frameTree.mainFrame());
   }
 
-  _setInterceptFileChooserDialog({enabled}) {
-    this._docShell.fileInputInterceptionEnabled = !!enabled;
-  }
-
   _linkClicked(sync, anchorElement) {
     if (anchorElement.ownerGlobal.docShell !== this._docShell)
       return;
@@ -357,23 +241,25 @@ class PageAgent {
   }
 
   _filePickerShown(inputElement) {
-    if (inputElement.ownerGlobal.docShell !== this._docShell)
+    const frame = this._findFrameForNode(inputElement);
+    if (!frame)
       return;
-    const frameData = this._findFrameForNode(inputElement);
     this._browserPage.emit('pageFileChooserOpened', {
-      executionContextId: frameData._frame.executionContext().id(),
-      element: frameData._frame.executionContext().rawValueToRemoteObject(inputElement)
+      executionContextId: frame.mainExecutionContext().id(),
+      element: frame.mainExecutionContext().rawValueToRemoteObject(inputElement)
     });
   }
 
   _findFrameForNode(node) {
-    return Array.from(this._frameData.values()).find(data => {
-      const doc = data._frame.domWindow().document;
+    return this._frameTree.frames().find(frame => {
+      const doc = frame.domWindow().document;
       return node === doc || node.ownerDocument === doc;
     });
   }
 
-  _onDOMContentLoaded(event) {
+  onWindowEvent(event) {
+    if (event.type !== 'DOMContentLoaded' && event.type !== 'load')
+      return;
     if (!event.target.ownerGlobal)
       return;
     const docShell = event.target.ownerGlobal.docShell;
@@ -382,19 +268,15 @@ class PageAgent {
       return;
     this._browserPage.emit('pageEventFired', {
       frameId: frame.id(),
-      name: 'DOMContentLoaded',
+      name: event.type,
     });
   }
 
-  _onError(errorEvent) {
-    const docShell = errorEvent.target.ownerGlobal.docShell;
-    const frame = this._frameTree.frameForDocShell(docShell);
-    if (!frame)
-      return;
+  _onRuntimeError({ executionContext, message, stack }) {
     this._browserPage.emit('pageUncaughtError', {
-      frameId: frame.id(),
-      message: errorEvent.message,
-      stack: errorEvent.error ? errorEvent.error.stack : '',
+      frameId: executionContext.auxData().frameId,
+      message: message.toString(),
+      stack: stack.toString(),
     });
   }
 
@@ -409,22 +291,10 @@ class PageAgent {
     });
   }
 
-  _onLoad(event) {
-    const docShell = event.target.ownerGlobal.docShell;
-    const frame = this._frameTree.frameForDocShell(docShell);
-    if (!frame)
-      return;
-    this._browserPage.emit('pageEventFired', {
-      frameId: frame.id(),
-      name: 'load'
-    });
-  }
-
   _onNavigationStarted(frame) {
     this._browserPage.emit('pageNavigationStarted', {
       frameId: frame.id(),
       navigationId: frame.pendingNavigationId(),
-      url: frame.pendingNavigationURL(),
     });
   }
 
@@ -434,10 +304,9 @@ class PageAgent {
       navigationId,
       errorText,
     });
-    const frameData = this._frameData.get(frame);
-    if (!frameData._initialNavigationDone && frame !== this._frameTree.mainFrame())
+    if (!frame._initialNavigationDone && frame !== this._frameTree.mainFrame())
       this._emitAllEvents(frame);
-    frameData._initialNavigationDone = true;
+    frame._initialNavigationDone = true;
   }
 
   _onSameDocumentNavigation(frame) {
@@ -454,11 +323,7 @@ class PageAgent {
       url: frame.url(),
       name: frame.name(),
     });
-    this._frameData.get(frame)._initialNavigationDone = true;
-  }
-
-  _onGlobalObjectCreated({ frame }) {
-    this._frameData.get(frame).reset();
+    frame._initialNavigationDone = true;
   }
 
   _onFrameAttached(frame) {
@@ -466,19 +331,17 @@ class PageAgent {
       frameId: frame.id(),
       parentFrameId: frame.parentFrame() ? frame.parentFrame().id() : undefined,
     });
-    this._frameData.set(frame, new FrameData(this, this._runtime, frame));
   }
 
   _onFrameDetached(frame) {
-    this._frameData.delete(frame);
     this._browserPage.emit('pageFrameDetached', {
       frameId: frame.id(),
     });
   }
 
-  _onBindingCalled({frame, name, payload}) {
+  _onBindingCalled({executionContextId, name, payload}) {
     this._browserPage.emit('pageBindingCalled', {
-      executionContextId: frame.executionContext().id(),
+      executionContextId,
       name,
       payload
     });
@@ -488,74 +351,19 @@ class PageAgent {
     for (const workerData of this._workerData.values())
       workerData.dispose();
     this._workerData.clear();
-    for (const frameData of this._frameData.values())
-      frameData.dispose();
-    this._frameData.clear();
     helper.removeListeners(this._eventListeners);
-  }
-
-  async _navigate({frameId, url, referer}) {
-    try {
-      const uri = NetUtil.newURI(url);
-    } catch (e) {
-      throw new Error(`Invalid url: "${url}"`);
-    }
-    let referrerURI = null;
-    let referrerInfo = null;
-    if (referer) {
-      try {
-        referrerURI = NetUtil.newURI(referer);
-        const ReferrerInfo = Components.Constructor(
-          '@mozilla.org/referrer-info;1',
-          'nsIReferrerInfo',
-          'init'
-        );
-        referrerInfo = new ReferrerInfo(Ci.nsIHttpChannel.REFERRER_POLICY_UNSET, true, referrerURI);
-      } catch (e) {
-        throw new Error(`Invalid referer: "${referer}"`);
-      }
-    }
-    const frame = this._frameTree.frame(frameId);
-    const docShell = frame.docShell().QueryInterface(Ci.nsIWebNavigation);
-    docShell.loadURI(url, {
-      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
-      flags: Ci.nsIWebNavigation.LOAD_FLAGS_NONE,
-      referrerInfo,
-      postData: null,
-      headers: null,
-    });
-    return {navigationId: frame.pendingNavigationId(), navigationURL: frame.pendingNavigationURL()};
-  }
-
-  async _reload({frameId, url}) {
-    const frame = this._frameTree.frame(frameId);
-    const docShell = frame.docShell().QueryInterface(Ci.nsIWebNavigation);
-    docShell.reload(Ci.nsIWebNavigation.LOAD_FLAGS_NONE);
-  }
-
-  async _goBack({frameId, url}) {
-    const frame = this._frameTree.frame(frameId);
-    const docShell = frame.docShell();
-    if (!docShell.canGoBack)
-      return {success: false};
-    docShell.goBack();
-    return {success: true};
-  }
-
-  async _goForward({frameId, url}) {
-    const frame = this._frameTree.frame(frameId);
-    const docShell = frame.docShell();
-    if (!docShell.canGoForward)
-      return {success: false};
-    docShell.goForward();
-    return {success: true};
   }
 
   async _adoptNode({frameId, objectId, executionContextId}) {
     const frame = this._frameTree.frame(frameId);
     if (!frame)
       throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
+    let unsafeObject;
+    if (!objectId) {
+      unsafeObject = frame.domWindow().frameElement;
+    } else {
+      unsafeObject = frame.unsafeObject(objectId);
+    }
     const context = this._runtime.findExecutionContext(executionContextId);
     const fromPrincipal = unsafeObject.nodePrincipal;
     const toFrame = this._frameTree.frame(context.auxData().frameId);
@@ -569,7 +377,7 @@ class PageAgent {
     const frame = this._frameTree.frame(frameId);
     if (!frame)
       throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
+    const unsafeObject = frame.unsafeObject(objectId);
     if (!unsafeObject)
       throw new Error('Object is not input!');
     const nsFiles = await Promise.all(files.map(filePath => File.createFromFileName(filePath)));
@@ -580,10 +388,10 @@ class PageAgent {
     const frame = this._frameTree.frame(frameId);
     if (!frame)
       throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
+    const unsafeObject = frame.unsafeObject(objectId);
     if (!unsafeObject.getBoxQuads)
       throw new Error('RemoteObject is not a node');
-    const quads = unsafeObject.getBoxQuads({relativeTo: this._frameTree.mainFrame().domWindow().document}).map(quad => {
+    const quads = unsafeObject.getBoxQuads({relativeTo: this._frameTree.mainFrame().domWindow().document, recurseWhenNoFrame: true}).map(quad => {
       return {
         p1: {x: quad.p1.x, y: quad.p1.y},
         p2: {x: quad.p2.x, y: quad.p2.y},
@@ -598,7 +406,7 @@ class PageAgent {
     const frame = this._frameTree.frame(frameId);
     if (!frame)
       throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
+    const unsafeObject = frame.unsafeObject(objectId);
     const browsingContextGroup = frame.docShell().browsingContext.group;
     const frames = this._frameTree.allFramesInBrowsingContextGroup(browsingContextGroup);
     let contentFrame;
@@ -620,7 +428,7 @@ class PageAgent {
     const frame = this._frameTree.frame(frameId);
     if (!frame)
       throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
+    const unsafeObject = frame.unsafeObject(objectId);
     if (!unsafeObject.isConnected)
       throw new Error('Node is detached from document');
     if (!rect)
@@ -651,47 +459,9 @@ class PageAgent {
     return {x: x1, y: y1, width: x2 - x1, height: y2 - y1};
   }
 
-  async _getBoundingBox({frameId, objectId}) {
-    const frame = this._frameTree.frame(frameId);
-    if (!frame)
-      throw new Error('Failed to find frame with id = ' + frameId);
-    const unsafeObject = this._frameData.get(frame).unsafeObject(objectId);
-    const box = this._getNodeBoundingBox(unsafeObject);
-    if (!box)
-      return {boundingBox: null};
-    return {boundingBox: {x: box.x + frame.domWindow().scrollX, y: box.y + frame.domWindow().scrollY, width: box.width, height: box.height}};
-  }
-
-  async _screenshot({mimeType, fullPage, clip}) {
-    const content = this._messageManager.content;
-    if (clip) {
-      const data = takeScreenshot(content, clip.x, clip.y, clip.width, clip.height, mimeType);
-      return {data};
-    }
-    if (fullPage) {
-      const rect = content.document.documentElement.getBoundingClientRect();
-      const width = content.innerWidth + content.scrollMaxX - content.scrollMinX;
-      const height = content.innerHeight + content.scrollMaxY - content.scrollMinY;
-      const data = takeScreenshot(content, 0, 0, width, height, mimeType);
-      return {data};
-    }
-    const data = takeScreenshot(content, content.scrollX, content.scrollY, content.innerWidth, content.innerHeight, mimeType);
-    return {data};
-  }
-
   async _dispatchKeyEvent({type, keyCode, code, key, repeat, location, text}) {
-    // key events don't fire if we are dragging.
-    if (this._dataTransfer) {
-      if (type === 'keydown' && key === 'Escape')
-        this._cancelDragIfNeeded();
-      return;
-    }
     const frame = this._frameTree.mainFrame();
     const tip = frame.textInputProcessor();
-    if (key === 'Meta' && Services.appinfo.OS !== 'Darwin')
-      key = 'OS';
-    else if (key === 'OS' && Services.appinfo.OS === 'Darwin')
-      key = 'Meta';
     let keyEvent = new (frame.domWindow().KeyboardEvent)("", {
       key,
       code,
@@ -727,105 +497,118 @@ class PageAgent {
       touchPoints.map(point => point.radiusY === undefined ? 1.0 : point.radiusY),
       touchPoints.map(point => point.rotationAngle === undefined ? 0.0 : point.rotationAngle),
       touchPoints.map(point => point.force === undefined ? 1.0 : point.force),
-      touchPoints.length,
+      touchPoints.map(point => 0),
+      touchPoints.map(point => 0),
+      touchPoints.map(point => 0),
       modifiers);
     return {defaultPrevented};
   }
 
-  _startDragSessionIfNeeded() {
-    const sess = dragService.getCurrentSession();
-    if (sess) return;
-    dragService.startDragSessionForTests(
-      Ci.nsIDragService.DRAGDROP_ACTION_MOVE |
-        Ci.nsIDragService.DRAGDROP_ACTION_COPY |
-        Ci.nsIDragService.DRAGDROP_ACTION_LINK
-    );
-  }
-
-  _simulateDragEvent(type, x, y, modifiers) {
-    const window = this._frameTree.mainFrame().domWindow();
-    const element = window.windowUtils.elementFromPoint(x, y, false, false);
-    const event = window.document.createEvent('DragEvent');
-
-    event.initDragEvent(
-      type,
-      true /* bubble */,
-      true /* cancelable */,
-      window,
-      0 /* clickCount */,
-      window.mozInnerScreenX + x,
-      window.mozInnerScreenY + y,
+  async _dispatchTapEvent({x, y, modifiers}) {
+    // Force a layout at the point in question, because touch events
+    // do not seem to trigger one like mouse events.
+    this._frameTree.mainFrame().domWindow().windowUtils.elementFromPoint(
       x,
       y,
-      modifiers & 2 /* ctrlkey */,
-      modifiers & 1 /* altKey */,
-      modifiers & 4 /* shiftKey */,
-      modifiers & 8 /* metaKey */,
-      0 /* button */, // firefox always has the button as 0 on drops, regardless of which was pressed
-      null /* relatedTarget */,
-      this._dataTransfer
-    );
+      false /* aIgnoreRootScrollFrame */,
+      true /* aFlushLayout */);
 
-    window.windowUtils.dispatchDOMEventViaPresShellForTesting(element, event);
-    if (type === 'drop')
-      dragService.endDragSession(true);
-  }
-
-  _cancelDragIfNeeded() {
-    this._dataTransfer = null;
-    const sess = dragService.getCurrentSession();
-    if (sess)
-      dragService.endDragSession(false);
-  }
-
-  async _dispatchMouseEvent({type, x, y, button, clickCount, modifiers, buttons}) {
-    this._startDragSessionIfNeeded();
-    const trapDrag = subject => {
-      this._dataTransfer = subject.mozCloneForEvent('drop');
-    }
+    const {defaultPrevented: startPrevented} = await this._dispatchTouchEvent({
+      type: 'touchstart',
+      modifiers,
+      touchPoints: [{x, y}]
+    });
+    const {defaultPrevented: endPrevented} = await this._dispatchTouchEvent({
+      type: 'touchend',
+      modifiers,
+      touchPoints: [{x, y}]
+    });
+    if (startPrevented || endPrevented)
+      return;
 
     const frame = this._frameTree.mainFrame();
-
-    obs.addObserver(trapDrag, 'on-datatransfer-available');
-    frame.domWindow().windowUtils.sendMouseEvent(
-      type,
+    const winUtils = frame.domWindow().windowUtils;
+    winUtils.jugglerSendMouseEvent(
+      'mousemove',
       x,
       y,
-      button,
-      clickCount,
+      0 /*button*/,
+      0 /*clickCount*/,
       modifiers,
       false /*aIgnoreRootScrollFrame*/,
-      undefined /*pressure*/,
-      undefined /*inputSource*/,
-      undefined /*isDOMEventSynthesized*/,
-      undefined /*isWidgetEventSynthesized*/,
-      buttons);
-    obs.removeObserver(trapDrag, 'on-datatransfer-available');
+      0.0 /*pressure*/,
+      5 /*inputSource*/,
+      true /*isDOMEventSynthesized*/,
+      false /*isWidgetEventSynthesized*/,
+      0 /*buttons*/,
+      winUtils.DEFAULT_MOUSE_POINTER_ID /* pointerIdentifier */,
+      true /*disablePointerEvent*/
+    );
 
-    if (type === 'mousedown' && button === 2) {
-      frame.domWindow().windowUtils.sendMouseEvent(
-        'contextmenu',
+    winUtils.jugglerSendMouseEvent(
+      'mousedown',
+      x,
+      y,
+      0 /*button*/,
+      1 /*clickCount*/,
+      modifiers,
+      false /*aIgnoreRootScrollFrame*/,
+      0.0 /*pressure*/,
+      5 /*inputSource*/,
+      true /*isDOMEventSynthesized*/,
+      false /*isWidgetEventSynthesized*/,
+      1 /*buttons*/,
+      winUtils.DEFAULT_MOUSE_POINTER_ID /*pointerIdentifier*/,
+      true /*disablePointerEvent*/,
+    );
+
+    winUtils.jugglerSendMouseEvent(
+      'mouseup',
+      x,
+      y,
+      0 /*button*/,
+      1 /*clickCount*/,
+      modifiers,
+      false /*aIgnoreRootScrollFrame*/,
+      0.0 /*pressure*/,
+      5 /*inputSource*/,
+      true /*isDOMEventSynthesized*/,
+      false /*isWidgetEventSynthesized*/,
+      0 /*buttons*/,
+      winUtils.DEFAULT_MOUSE_POINTER_ID /*pointerIdentifier*/,
+      true /*disablePointerEvent*/,
+    );
+  }
+
+  async _dispatchDragEvent({type, x, y, modifiers}) {
+    const session = dragService.getCurrentSession();
+    const dropEffect = session.dataTransfer.dropEffect;
+
+    if ((type === 'drop' && dropEffect !== 'none') || type ===  'dragover') {
+      const win = this._frameTree.mainFrame().domWindow();
+      win.windowUtils.jugglerSendMouseEvent(
+        type,
         x,
         y,
-        button,
-        clickCount,
+        0, /*button*/
+        0, /*clickCount*/
         modifiers,
         false /*aIgnoreRootScrollFrame*/,
-        undefined /*pressure*/,
-        undefined /*inputSource*/,
-        undefined /*isDOMEventSynthesized*/,
-        undefined /*isWidgetEventSynthesized*/,
-        buttons);
+        0.0 /*pressure*/,
+        0 /*inputSource*/,
+        true /*isDOMEventSynthesized*/,
+        false /*isWidgetEventSynthesized*/,
+        0 /*buttons*/,
+        win.windowUtils.DEFAULT_MOUSE_POINTER_ID /* pointerIdentifier */,
+        false /*disablePointerEvent*/,
+      );
+      return;
     }
-
-    // update drag state
-    if (this._dataTransfer) {
-      if (type === 'mousemove')
-        this._simulateDragEvent('dragover', x, y, modifiers);
-      else if (type === 'mouseup') // firefox will do drops when any mouse button is released
-        this._simulateDragEvent('drop', x, y, modifiers);
-    } else {
-      this._cancelDragIfNeeded();
+    if (type === 'dragend') {
+      const session = dragService.getCurrentSession();
+      if (session)
+        dragService.endDragSession(true);
+      return;
     }
   }
 
@@ -850,7 +633,7 @@ class PageAgent {
   async _getFullAXTree({objectId}) {
     let unsafeObject = null;
     if (objectId) {
-      unsafeObject = this._frameData.get(this._frameTree.mainFrame()).unsafeObject(objectId);
+      unsafeObject = this._frameTree.mainFrame().unsafeObject(objectId);
       if (!unsafeObject)
         throw new Error(`No object found for id "${objectId}"`);
     }
@@ -918,7 +701,6 @@ class PageAgent {
         'focused',
         'pressed',
         'focusable',
-        'haspopup',
         'required',
         'invalid',
         'modal',
@@ -955,7 +737,7 @@ class PageAgent {
         if (numericalProperty in attributes)
           tree[numericalProperty] = parseFloat(attributes[numericalProperty]);
       }
-      for (const stringProperty of ['tag', 'roledescription', 'valuetext', 'orientation', 'autocomplete', 'keyshortcuts']) {
+      for (const stringProperty of ['tag', 'roledescription', 'valuetext', 'orientation', 'autocomplete', 'keyshortcuts', 'haspopup']) {
         if (stringProperty in attributes)
           tree[stringProperty] = attributes[stringProperty];
       }
@@ -974,27 +756,6 @@ class PageAgent {
     };
   }
 }
-
-function takeScreenshot(win, left, top, width, height, mimeType) {
-  const MAX_SKIA_DIMENSIONS = 32767;
-
-  const scale = win.devicePixelRatio;
-  const canvasWidth = width * scale;
-  const canvasHeight = height * scale;
-
-  if (canvasWidth > MAX_SKIA_DIMENSIONS || canvasHeight > MAX_SKIA_DIMENSIONS)
-    throw new Error('Cannot take screenshot larger than ' + MAX_SKIA_DIMENSIONS);
-
-  const canvas = win.document.createElementNS('http://www.w3.org/1999/xhtml', 'canvas');
-  canvas.width = canvasWidth;
-  canvas.height = canvasHeight;
-
-  let ctx = canvas.getContext('2d');
-  ctx.scale(scale, scale);
-  ctx.drawWindow(win, left, top, width, height, 'rgb(255,255,255)', ctx.DRAWWINDOW_DRAW_CARET);
-  const dataURL = canvas.toDataURL(mimeType);
-  return dataURL.substring(dataURL.indexOf(',') + 1);
-};
 
 var EXPORTED_SYMBOLS = ['PageAgent'];
 this.PageAgent = PageAgent;

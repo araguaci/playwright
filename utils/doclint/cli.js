@@ -15,133 +15,302 @@
  * limitations under the License.
  */
 
-const playwright = require('../../');
+//@ts-check
+
+const playwright = require('playwright-core');
+const fs = require('fs');
 const path = require('path');
-const Source = require('./Source');
-const Message = require('./Message');
+const { parseApi } = require('./api_parser');
+const missingDocs = require('./missingDocs');
+const md = require('../markdown');
+const docs = require('./documentation');
+const toKebabCase = require('lodash/kebabCase')
 
-const {spawnSync} = require('child_process');
-
-const os = require('os');
+/** @typedef {import('./documentation').Type} Type */
+/** @typedef {import('../markdown').MarkdownNode} MarkdownNode */
 
 const PROJECT_DIR = path.join(__dirname, '..', '..');
-const VERSION = require(path.join(PROJECT_DIR, 'package.json')).version;
 
-const RED_COLOR = '\x1b[31m';
-const YELLOW_COLOR = '\x1b[33m';
-const RESET_COLOR = '\x1b[0m';
+const dirtyFiles = new Set();
 
-run();
+run().catch(e => {
+  console.error(e);
+  process.exit(1);
+});;
+
+function getAllMarkdownFiles(dirPath, filePaths = []) {
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+      filePaths.push(path.join(dirPath, entry.name));
+    else if (entry.isDirectory())
+      getAllMarkdownFiles(path.join(dirPath, entry.name), filePaths);
+  }
+  return filePaths;
+}
 
 async function run() {
-  const startTime = Date.now();
-  const onlyBrowserVersions = process.argv.includes('--only-browser-versions');
-
-  /** @type {!Array<!Message>} */
-  const messages = [];
-  let changedFiles = false;
-
-  // Documentation checks.
+  // Patch README.md
+  const versions = await getBrowserVersions();
   {
-    const readme = await Source.readFile(path.join(PROJECT_DIR, 'README.md'));
-    const contributing = await Source.readFile(path.join(PROJECT_DIR, 'CONTRIBUTING.md'));
-    const api = await Source.readFile(path.join(PROJECT_DIR, 'docs', 'api.md'));
-    const docs = await Source.readdir(path.join(PROJECT_DIR, 'docs'), '.md');
-    const mdSources = [readme, api, contributing, ...docs];
+    const params = new Map();
+    const { chromium, firefox, webkit } = versions;
+    params.set('chromium-version', chromium);
+    params.set('firefox-version', firefox);
+    params.set('webkit-version', webkit);
+    params.set('chromium-version-badge', `[![Chromium version](https://img.shields.io/badge/chromium-${chromium}-blue.svg?logo=google-chrome)](https://www.chromium.org/Home)`);
+    params.set('firefox-version-badge', `[![Firefox version](https://img.shields.io/badge/firefox-${firefox}-blue.svg?logo=firefoxbrowser)](https://www.mozilla.org/en-US/firefox/new/)`);
+    params.set('webkit-version-badge', `[![WebKit version](https://img.shields.io/badge/webkit-${webkit}-blue.svg?logo=safari)](https://webkit.org/)`);
 
-    const preprocessor = require('./preprocessor');
-    const browserVersions = await getBrowserVersions();
-    messages.push(...(await preprocessor.runCommands(mdSources, {
-      libversion: VERSION,
-      chromiumVersion: browserVersions.chromium,
-      firefoxVersion: browserVersions.firefox,
-      onlyBrowserVersions,
-    })));
+    let content = fs.readFileSync(path.join(PROJECT_DIR, 'README.md')).toString();
+    content = content.replace(/<!-- GEN:([^ ]+) -->([^<]*)<!-- GEN:stop -->/ig, (match, p1) => {
+      if (!params.has(p1)) {
+        console.log(`ERROR: Invalid generate parameter "${p1}" in "${match}"`);
+        process.exit(1);
+      }
+      return `<!-- GEN:${p1} -->${params.get(p1)}<!-- GEN:stop -->`;
+    });
+    writeAssumeNoop(path.join(PROJECT_DIR, 'README.md'), content, dirtyFiles);
+  }
 
-    if (!onlyBrowserVersions) {
-      messages.push(...preprocessor.autocorrectInvalidLinks(PROJECT_DIR, mdSources, getRepositoryFiles()));
-      for (const source of mdSources.filter(source => source.hasUpdatedText()))
-        messages.push(Message.warning(`WARN: updated ${source.projectPath()}`));
+  let playwrightVersion = require(path.join(PROJECT_DIR, 'package.json')).version;
+  if (playwrightVersion.endsWith('-next'))
+    playwrightVersion = playwrightVersion.substring(0, playwrightVersion.indexOf('-next'));
 
-      const browser = await playwright.chromium.launch();
-      const page = await browser.newPage();
-      const checkPublicAPI = require('./check_public_api');
-      const jsSources = await Source.readdir(path.join(PROJECT_DIR, 'src', 'client'), '', []);
-      messages.push(...await checkPublicAPI(page, [api], jsSources));
-      await browser.close();
+  // Ensure browser versions in browsers.json. This is most important for WebKit
+  // since its version is hardcoded in Playwright library rather then in browser builds.
+  // @see https://github.com/microsoft/playwright/issues/15702
+  {
+    const browsersJSONPath = path.join(__dirname, '..', '..', 'packages/playwright-core/browsers.json');
+    const browsersJSON = JSON.parse(await fs.promises.readFile(browsersJSONPath, 'utf8'));
+    for (const browser of browsersJSON.browsers) {
+      if (versions[browser.name])
+        browser.browserVersion = versions[browser.name];
     }
+    writeAssumeNoop(browsersJSONPath, JSON.stringify(browsersJSON, null, 2) + '\n', dirtyFiles);
+  }
 
-    for (const source of mdSources) {
-      if (!source.hasUpdatedText())
-        continue;
-      await source.save();
-      changedFiles = true;
+  // Update device descriptors
+  {
+    const devicesDescriptorsSourceFile = path.join(PROJECT_DIR, 'packages', 'playwright-core', 'src', 'server', 'deviceDescriptorsSource.json')
+    const devicesDescriptors = require(devicesDescriptorsSourceFile)
+    for (const deviceName of Object.keys(devicesDescriptors)) {
+      switch (devicesDescriptors[deviceName].defaultBrowserType) {
+        case 'chromium':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /(.*Chrome\/)(.*?)( .*)/,
+            `$1${versions.chromium}$3`
+          ).replace(
+            /(.*Edg\/)(.*?)$/,
+            `$1${versions.chromium}`
+          )
+          break;
+        case 'firefox':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /^(.*Firefox\/)(.*?)( .*?)?$/,
+            `$1${versions.firefox}$3`
+          ).replace(/^(.*rv:)(.*)(\).*?)$/, `$1${versions.firefox}$3`)
+          break;
+        case 'webkit':
+          devicesDescriptors[deviceName].userAgent = devicesDescriptors[deviceName].userAgent.replace(
+            /(.*Version\/)(.*?)( .*)/,
+            `$1${versions.webkit}$3`
+          )
+          break;
+        default:
+          break;
+      }
+    }
+    const invalidConfigurations = Object.entries(devicesDescriptors).filter(([_, deviceDescriptor]) => deviceDescriptor.isMobile && deviceDescriptor.defaultBrowserType === 'firefox').map(([deviceName, deviceDescriptor]) => deviceName);
+    if (invalidConfigurations.length > 0)
+      throw new Error(`Invalid Device Configurations. isMobile with Firefox not supported: ${invalidConfigurations.join(', ')}`);
+    writeAssumeNoop(devicesDescriptorsSourceFile, JSON.stringify(devicesDescriptors, null, 2), dirtyFiles);
+  }
+
+  // Validate links/code snippet langs
+  {
+    const langs = ['js', 'java', 'python', 'csharp'];
+    const documentationRoot = path.join(PROJECT_DIR, 'docs', 'src');
+    for (const lang of langs) {
+      try {
+        let documentation = parseApi(path.join(documentationRoot, 'api'));
+        if (lang === 'js') {
+          documentation = documentation.mergeWith(
+            parseApi(path.join(documentationRoot, 'test-api'), path.join(documentationRoot, 'api', 'params.md'))
+          ).mergeWith(
+            parseApi(path.join(documentationRoot, 'test-reporter-api'))
+          );
+        }
+        documentation.filterForLanguage(lang);
+
+        // This validates member links.
+        documentation.setLinkRenderer(() => undefined);
+        // This validates code snippet groups in comments.
+        documentation.setCodeGroupsTransformer(lang, tabs => tabs.map(tab => tab.spec));
+        documentation.generateSourceCodeComments();
+
+        const mdLinks = [];
+        const mdSections = new Set();
+
+        for (const cls of documentation.classesArray) {
+          const filePath = path.join(documentationRoot, 'api', 'class-' + cls.name.toLowerCase() + '.md');
+          for (const member of cls.membersArray) {
+            const memberHash = filePath + '#' + toKebabCase(cls.name).toLowerCase() + '-' + toKebabCase(member.name).toLowerCase()
+            mdSections.add(memberHash);
+            for (const arg of member.argsArray) {
+              mdSections.add(memberHash + '-option-' + toKebabCase(arg.name).toLowerCase());
+              if (arg.name === "options" && arg.type) {
+                for (const option of arg.type.deepProperties())
+                  mdSections.add(memberHash + '-option-' + toKebabCase(option.name).toLowerCase());
+              }
+            }
+          }
+
+          for (const event of cls.eventsArray)
+            mdSections.add(filePath + '#' + toKebabCase(cls.name).toLowerCase() + '-event-' + toKebabCase(event.name).toLowerCase());
+        }
+
+        for (const filePath of getAllMarkdownFiles(documentationRoot)) {
+          if (!filePath.includes(`-${lang}`) && langs.some(other => other !== lang && filePath.includes(`-${other}`)))
+            continue;
+
+          // Standardise naming and remove the filter in the file name
+          // Also, Internally (playwright.dev generator) we merge test-api and test-reporter-api into api.
+          const canonicalName = filePath.replace(/(-(js|python|csharp|java))+/, '').replace(/(\/|\\)(test-api|test-reporter-api)(\/|\\)/, `${path.sep}api${path.sep}`);
+          mdSections.add(canonicalName);
+
+          const data = fs.readFileSync(filePath, 'utf-8');
+          let rootNode = md.filterNodesForLanguage(md.parse(data), lang);
+          // Validates code snippet groups.
+          rootNode = docs.processCodeGroups(rootNode, lang, tabs => tabs.map(tab => tab.spec));
+          // Renders links.
+          documentation.renderLinksInNodes(rootNode);
+          // Validate links.
+          {
+            md.visitAll(rootNode, node => {
+              if (node.type === 'code') {
+                const allowedCodeLangs = new Set([
+                  'csharp',
+                  'java',
+                  'css',
+                  'js',
+                  'ts',
+                  'python',
+                  'py',
+                  'java',
+                  'powershell',
+                  'batch',
+                  'ini',
+                  'txt',
+                  'html',
+                  'xml',
+                  'yml',
+                  'yaml',
+                  'json',
+                  'groovy',
+                  'html',
+                  'bash',
+                  'sh',
+                  'Dockerfile',
+                ]);
+                if (!allowedCodeLangs.has(node.codeLang.split(' ')[0]))
+                  throw new Error(`${path.relative(PROJECT_DIR, filePath)} contains code block with invalid code block language ${node.codeLang}`);
+              }
+              if (node.type.startsWith('h')) {
+                const hash = mdSectionHash(node.text || '');
+                mdSections.add(canonicalName + '#' + hash);
+              }
+              if (!node.text)
+                return;
+              // Match links in a lax way (.+), so they can include spaces, backticks etc.
+              for (const [, mdLinkName, mdLink] of node.text.matchAll(/\[(.+)\]\((.*?)\)/g)) {
+                const isExternal = mdLink.startsWith('http://') || mdLink.startsWith('https://');
+                if (isExternal)
+                  continue;
+
+                const [beforeHash, hash] = mdLink.split('#');
+                let linkWithoutHash = canonicalName;
+                if (beforeHash) {
+                  // Not same-file link.
+                  linkWithoutHash = path.join(path.dirname(filePath), beforeHash);
+                  if (path.extname(linkWithoutHash) !== '.md')
+                    linkWithoutHash += '.md';
+                }
+                mdLinks.push({ filePath, linkTarget: linkWithoutHash + (hash ? '#' + hash : ''), name: mdLinkName });
+              }
+            });
+          }
+        }
+
+        const badLinks = [];
+        for (const { filePath, linkTarget, name } of mdLinks) {
+          if (!mdSections.has(linkTarget))
+            badLinks.push(`${path.relative(PROJECT_DIR, filePath)} references to '${linkTarget}' as '${name}' which does not exist.`);
+        }
+        if (badLinks.length)
+          throw new Error('Broken links found:\n' + badLinks.join('\n'));
+
+      } catch (e) {
+        e.message = `While processing "${lang}"\n` + e.message;
+        throw e;
+      }
     }
   }
 
-  // Report results.
-  const errors = messages.filter(message => message.type === 'error');
-  if (errors.length) {
-    console.log('DocLint Failures:');
-    for (let i = 0; i < errors.length; ++i) {
-      let error = errors[i].text;
-      error = error.split('\n').join('\n      ');
-      console.log(`  ${i + 1}) ${RED_COLOR}${error}${RESET_COLOR}`);
+  // Check for missing docs
+  {
+    const apiDocumentation = parseApi(path.join(PROJECT_DIR, 'docs', 'src', 'api'));
+    apiDocumentation.filterForLanguage('js');
+    const srcClient = path.join(PROJECT_DIR, 'packages', 'playwright-core', 'src', 'client');
+    const sources = fs.readdirSync(srcClient).map(n => path.join(srcClient, n));
+    const errors = missingDocs(apiDocumentation, sources, path.join(srcClient, 'api.ts'));
+    if (errors.length) {
+      console.log('============================');
+      console.log('ERROR: missing documentation:');
+      errors.forEach(e => console.log(e));
+      console.log('============================')
+      process.exit(1);
     }
   }
-  const warnings = messages.filter(message => message.type === 'warning');
-  if (warnings.length) {
-    console.log('DocLint Warnings:');
-    for (let i = 0; i < warnings.length; ++i) {
-      let warning = warnings[i].text;
-      warning = warning.split('\n').join('\n      ');
-      console.log(`  ${i + 1}) ${YELLOW_COLOR}${warning}${RESET_COLOR}`);
-    }
+
+  if (dirtyFiles.size) {
+    console.log('============================')
+    console.log('ERROR: generated files have changed, this is only error if happens in CI:');
+    [...dirtyFiles].forEach(f => console.log(f));
+    console.log('============================')
+    process.exit(1);
   }
-  let clearExit = messages.length === 0;
-  if (changedFiles) {
-    if (clearExit)
-      console.log(`${YELLOW_COLOR}Some files were updated.${RESET_COLOR}`);
-    clearExit = false;
+  process.exit(0);
+}
+
+/**
+ * @param {string} name
+ * @param {string} content
+ * @param {Set<string>} dirtyFiles
+ */
+function writeAssumeNoop(name, content, dirtyFiles) {
+  fs.mkdirSync(path.dirname(name), { recursive: true });
+  const oldContent = fs.existsSync(name) ? fs.readFileSync(name).toString() : '';
+  if (oldContent !== content) {
+    fs.writeFileSync(name, content);
+    dirtyFiles.add(name);
   }
-  console.log(`${errors.length} failures, ${warnings.length} warnings.`);
-  const runningTime = Date.now() - startTime;
-  console.log(`DocLint Finished in ${runningTime / 1000} seconds`);
-  process.exit(clearExit || onlyBrowserVersions ? 0 : 1);
 }
 
 async function getBrowserVersions() {
-  const [chromium, firefox] = await Promise.all([
-    getChromeVersion(),
-    getFirefoxVersion(),
-  ])
-  return {
-    chromium,
-    firefox,
-  };
-}
-
-async function getChromeVersion() {
-  if (os.platform() === 'win32' || os.platform() === 'cygwin') {
-    const browser = await playwright.chromium.launch();
-    const page = await browser.newPage();
-    const userAgent = await page.evaluate('navigator.userAgent');
-    const [type] = userAgent.split(' ').filter(str => str.includes('Chrome'));
-    await browser.close();
-    return type.split('/')[1];
+  const names = ['chromium', 'firefox', 'webkit'];
+  const browsers = await Promise.all(names.map(name => playwright[name].launch()));
+  const result = {};
+  for (let i = 0; i < names.length; i++) {
+    result[names[i]] = browsers[i].version();
   }
-  const version = spawnSync(playwright.chromium.executablePath(), ['--version'], undefined).stdout.toString();
-  return version.trim().split(' ').pop();
+  await Promise.all(browsers.map(browser => browser.close()));
+  return result;
 }
 
-function getRepositoryFiles() {
-  const out = spawnSync('git', ['ls-files'], {cwd: PROJECT_DIR});
-  return out.stdout.toString().trim().split('\n').map(file => path.join(PROJECT_DIR, file));
-}
-
-async function getFirefoxVersion() {
-  const isWin = os.platform() === 'win32' || os.platform() === 'cygwin';
-  const out = spawnSync(playwright.firefox.executablePath(), [isWin ? '/version' : '--version'], undefined);
-  const version = out.stdout.toString();
-  return version.trim().split(' ').pop();
+/**
+ * @param {string} text
+ * @returns {string}
+ */
+function mdSectionHash(text) {
+  return text.toLowerCase().replace(/\s/g, '-').replace(/[^-_a-z0-9]/g, '').replace(/^-+/, '');
 }

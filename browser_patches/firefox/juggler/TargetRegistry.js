@@ -2,18 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-const {EventEmitter} = ChromeUtils.import('resource://gre/modules/EventEmitter.jsm');
 const {Helper} = ChromeUtils.import('chrome://juggler/content/Helper.js');
 const {SimpleChannel} = ChromeUtils.import('chrome://juggler/content/SimpleChannel.js');
-const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
 const {Preferences} = ChromeUtils.import("resource://gre/modules/Preferences.jsm");
 const {ContextualIdentityService} = ChromeUtils.import("resource://gre/modules/ContextualIdentityService.jsm");
 const {NetUtil} = ChromeUtils.import('resource://gre/modules/NetUtil.jsm');
-const {PageHandler} = ChromeUtils.import("chrome://juggler/content/protocol/PageHandler.js");
-const {NetworkHandler} = ChromeUtils.import("chrome://juggler/content/protocol/NetworkHandler.js");
-const {RuntimeHandler} = ChromeUtils.import("chrome://juggler/content/protocol/RuntimeHandler.js");
-const {AccessibilityHandler} = ChromeUtils.import("chrome://juggler/content/protocol/AccessibilityHandler.js");
 const {AppConstants} = ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
+
+const Cr = Components.results;
 
 const helper = new Helper();
 
@@ -29,29 +25,17 @@ class DownloadInterceptor {
   constructor(registry) {
     this._registry = registry
     this._handlerToUuid = new Map();
-    helper.addObserver(this._onRequest.bind(this), 'http-on-modify-request');
-  }
-
-  _onRequest(httpChannel, topic) {
-    let loadContext = helper.getLoadContext(httpChannel);
-    if (!loadContext)
-      return;
-    if (!loadContext.topFrameElement)
-      return;
-    const target = this._registry.targetForBrowser(loadContext.topFrameElement);
-    if (!target)
-      return;
-    target._channelIds.add(httpChannel.channelId);
+    this._uuidToHandler = new Map();
   }
 
   //
   // nsIDownloadInterceptor implementation.
   //
   interceptDownloadRequest(externalAppHandler, request, browsingContext, outFile) {
-    let pageTarget = this._registry._browserBrowsingContextToTarget.get(browsingContext);
-    // New page downloads won't have browsing contex.
-    if (!pageTarget)
-      pageTarget = this._registry._targetForChannel(request);
+    if (!(request instanceof Ci.nsIChannel))
+      return false;
+    const channel = request.QueryInterface(Ci.nsIChannel);
+    let pageTarget = this._registry._browserIdToTarget.get(channel.loadInfo.browsingContext.top.browserId);
     if (!pageTarget)
       return false;
 
@@ -70,16 +54,18 @@ class DownloadInterceptor {
       try {
         file.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
       } catch (e) {
-        dump(`interceptDownloadRequest failed to create file: ${e}\n`);
+        dump(`WARNING: interceptDownloadRequest failed to create file: ${e}\n`);
         return false;
       }
     }
     outFile.value = file;
     this._handlerToUuid.set(externalAppHandler, uuid);
+    this._uuidToHandler.set(uuid, externalAppHandler);
     const downloadInfo = {
       uuid,
       browserContextId: browserContext.browserContextId,
       pageTargetId: pageTarget.id(),
+      frameId: helper.browsingContextToFrameId(channel.loadInfo.browsingContext),
       url: request.name,
       suggestedFileName: externalAppHandler.suggestedFileName,
     };
@@ -92,26 +78,41 @@ class DownloadInterceptor {
     if (!uuid)
       return;
     this._handlerToUuid.delete(externalAppHandler);
+    this._uuidToHandler.delete(uuid);
     const downloadInfo = {
       uuid,
+      error: errorName,
     };
-    if (errorName === 'NS_BINDING_ABORTED') {
+    if (canceled === 'NS_BINDING_ABORTED') {
       downloadInfo.canceled = true;
-    } else {
-      downloadInfo.error = errorName;
     }
     this._registry.emit(TargetRegistry.Events.DownloadFinished, downloadInfo);
   }
+
+  async cancelDownload(uuid) {
+    const externalAppHandler = this._uuidToHandler.get(uuid);
+    if (!externalAppHandler) {
+      return;
+    }
+    await externalAppHandler.cancel(Cr.NS_BINDING_ABORTED);
+  }
 }
 
+const screencastService = Cc['@mozilla.org/juggler/screencast;1'].getService(Ci.nsIScreencastService);
+
 class TargetRegistry {
+  static instance() {
+    return TargetRegistry._instance || null;
+  }
+
   constructor() {
-    EventEmitter.decorate(this);
+    helper.decorateAsEventEmitter(this);
+    TargetRegistry._instance = this;
 
     this._browserContextIdToBrowserContext = new Map();
     this._userContextIdToBrowserContext = new Map();
     this._browserToTarget = new Map();
-    this._browserBrowsingContextToTarget = new Map();
+    this._browserIdToTarget = new Map();
 
     this._browserProxy = null;
 
@@ -133,69 +134,34 @@ class TargetRegistry {
         const target = this._browserToTarget.get(browser);
         if (!target)
           return;
-        target.emit('crashed');
+        target.emit(PageTarget.Events.Crashed);
         target.dispose();
       }
     }, 'oop-frameloader-crashed');
 
-    Services.mm.addMessageListener('juggler:content-ready', {
-      receiveMessage: message => {
-        const linkedBrowser = message.target;
-        if (this._browserToTarget.has(linkedBrowser))
-          throw new Error(`Internal error: two targets per linkedBrowser`);
-
-        let tab;
-        let gBrowser;
-        const windowsIt = Services.wm.getEnumerator('navigator:browser');
-        let window;
-        while (windowsIt.hasMoreElements()) {
-          window = windowsIt.getNext();
-          // gBrowser is always created before tabs. If gBrowser is not
-          // initialized yet the browser belongs to another window.
-          if (!window.gBrowser)
-            continue;
-          tab = window.gBrowser.getTabForBrowser(linkedBrowser);
-          if (tab) {
-            gBrowser = window.gBrowser;
-            break;
-          }
-        }
-        if (!tab)
-          return;
-
-        const { userContextId } = message.data;
-        const openerContext = linkedBrowser.browsingContext.opener;
-        let openerTarget;
-        if (openerContext) {
-          // Popups usually have opener context.
-          openerTarget = this._browserBrowsingContextToTarget.get(openerContext);
-        } else if (tab.openerTab) {
-          // Noopener popups from the same window have opener tab instead.
-          openerTarget = this._browserToTarget.get(tab.openerTab.linkedBrowser);
-        }
-        const browserContext = this._userContextIdToBrowserContext.get(userContextId);
-        if (!browserContext)
-          throw new Error(`Internal error: cannot find context for userContextId=${userContextId}`);
-        const target = new PageTarget(this, window, gBrowser, tab, linkedBrowser, browserContext, openerTarget);
-
-        const sessions = [];
-        const readyData = { sessions, target };
-        this.emit(TargetRegistry.Events.TargetCreated, readyData);
-        return {
-          scriptsToEvaluateOnNewDocument: browserContext ? browserContext.scriptsToEvaluateOnNewDocument : [],
-          bindings: browserContext ? browserContext.bindings : [],
-          settings: browserContext ? browserContext.settings : {},
-          sessionIds: sessions.map(session => session.sessionId()),
-        };
-      },
-    });
-
-    const onTabOpenListener = (window, event) => {
+    const onTabOpenListener = (appWindow, window, event) => {
       const tab = event.target;
       const userContextId = tab.userContextId;
       const browserContext = this._userContextIdToBrowserContext.get(userContextId);
-      if (browserContext && browserContext.defaultViewportSize)
-        setViewportSizeForBrowser(browserContext.defaultViewportSize, tab.linkedBrowser, window);
+      const hasExplicitSize = appWindow && (appWindow.chromeFlags & Ci.nsIWebBrowserChrome.JUGGLER_WINDOW_EXPLICIT_SIZE) !== 0;
+      const openerContext = tab.linkedBrowser.browsingContext.opener;
+      let openerTarget;
+      if (openerContext) {
+        // Popups usually have opener context. Get top context for the case when opener is
+        // an iframe.
+        openerTarget = this._browserIdToTarget.get(openerContext.top.browserId);
+      } else if (tab.openerTab) {
+        // Noopener popups from the same window have opener tab instead.
+        openerTarget = this._browserToTarget.get(tab.openerTab.linkedBrowser);
+      }
+      if (!browserContext)
+        throw new Error(`Internal error: cannot find context for userContextId=${userContextId}`);
+      const target = new PageTarget(this, window, tab, browserContext, openerTarget);
+      target.updateOverridesForBrowsingContext(tab.linkedBrowser.browsingContext);
+      if (!hasExplicitSize)
+        target.updateViewportSize();
+      if (browserContext.videoRecordingOptions)
+        target._startVideoRecording(browserContext.videoRecordingOptions);
     };
 
     const onTabCloseListener = event => {
@@ -206,39 +172,68 @@ class TargetRegistry {
           target.dispose();
     };
 
-    Services.wm.addListener({
-      onOpenWindow: async window => {
-        const domWindow = window.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowInternal || Ci.nsIDOMWindow);
-        if (!(domWindow instanceof Ci.nsIDOMChromeWindow))
-          return;
-        if (domWindow.document.readyState !== 'uninitialized')
-          throw new Error('DOMWindow should not be loaded yet');
-        await new Promise(fulfill => {
-          domWindow.addEventListener('DOMContentLoaded', function listener() {
-            domWindow.removeEventListener('DOMContentLoaded', listener);
-            fulfill();
-          });
-        });
-        if (!domWindow.gBrowser)
-          return;
-        domWindow.gBrowser.tabContainer.addEventListener('TabOpen', event => onTabOpenListener(domWindow, event));
-        domWindow.gBrowser.tabContainer.addEventListener('TabClose', onTabCloseListener);
-      },
-      onCloseWindow: window => {
-        const domWindow = window.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowInternal || Ci.nsIDOMWindow);
-        if (!(domWindow instanceof Ci.nsIDOMChromeWindow))
-          return;
-        if (!domWindow.gBrowser)
-          return;
-        domWindow.gBrowser.tabContainer.removeEventListener('TabOpen', onTabOpenListener);
-        domWindow.gBrowser.tabContainer.removeEventListener('TabClose', onTabCloseListener);
-        for (const tab of domWindow.gBrowser.tabs)
-          onTabCloseListener({ target: tab });
-      },
-    });
+    const domWindowTabListeners = new Map();
+
+    const onOpenWindow = async (appWindow) => {
+
+      let domWindow;
+      if (appWindow instanceof Ci.nsIAppWindow) {
+        domWindow = appWindow.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowInternal || Ci.nsIDOMWindow);
+      } else {
+        domWindow = appWindow;
+        appWindow = null;
+      }
+      if (!domWindow.isChromeWindow)
+        return;
+      // In persistent mode, window might be opened long ago and might be
+      // already initialized.
+      //
+      // In this case, we want to keep this callback synchronous so that we will call
+      // `onTabOpenListener` synchronously and before the sync IPc message `juggler:content-ready`.
+      if (domWindow.document.readyState === 'uninitialized' || domWindow.document.readyState === 'loading') {
+        // For non-initialized windows, DOMContentLoaded initializes gBrowser
+        // and starts tab loading (see //browser/base/content/browser.js), so we
+        // are guaranteed to call `onTabOpenListener` before the sync IPC message
+        // `juggler:content-ready`.
+        await helper.awaitEvent(domWindow, 'DOMContentLoaded');
+      }
+
+      if (!domWindow.gBrowser)
+        return;
+      const tabContainer = domWindow.gBrowser.tabContainer;
+      domWindowTabListeners.set(domWindow, [
+        helper.addEventListener(tabContainer, 'TabOpen', event => onTabOpenListener(appWindow, domWindow, event)),
+        helper.addEventListener(tabContainer, 'TabClose', onTabCloseListener),
+      ]);
+      for (const tab of domWindow.gBrowser.tabs)
+        onTabOpenListener(appWindow, domWindow, { target: tab });
+    };
+
+    const onCloseWindow = window => {
+      const domWindow = window.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowInternal || Ci.nsIDOMWindow);
+      if (!domWindow.isChromeWindow)
+        return;
+      if (!domWindow.gBrowser)
+        return;
+
+      const listeners = domWindowTabListeners.get(domWindow) || [];
+      domWindowTabListeners.delete(domWindow);
+      helper.removeListeners(listeners);
+      for (const tab of domWindow.gBrowser.tabs)
+        onTabCloseListener({ target: tab });
+    };
 
     const extHelperAppSvc = Cc["@mozilla.org/uriloader/external-helper-app-service;1"].getService(Ci.nsIExternalHelperAppService);
-    extHelperAppSvc.setDownloadInterceptor(new DownloadInterceptor(this));
+    this._downloadInterceptor = new DownloadInterceptor(this);
+    extHelperAppSvc.setDownloadInterceptor(this._downloadInterceptor);
+
+    Services.wm.addListener({ onOpenWindow, onCloseWindow });
+    for (const win of Services.wm.getEnumerator(null))
+      onOpenWindow(win);
+  }
+
+  async cancelDownload(options) {
+    this._downloadInterceptor.cancelDownload(options.uuid);
   }
 
   setBrowserProxy(proxy) {
@@ -308,20 +303,15 @@ class TargetRegistry {
     const window = Services.ww.openWindow(null, AppConstants.BROWSER_CHROME_URL, '_blank', features, args);
     await waitForWindowReady(window);
     if (window.gBrowser.browsers.length !== 1)
-      throw new Error(`Unexpcted number of tabs in the new window: ${window.gBrowser.browsers.length}`);
+      throw new Error(`Unexpected number of tabs in the new window: ${window.gBrowser.browsers.length}`);
     const browser = window.gBrowser.browsers[0];
-    const target = this._browserToTarget.get(browser) || await new Promise(fulfill => {
-      const listener = helper.on(this, TargetRegistry.Events.TargetCreated, ({target}) => {
-        if (target._linkedBrowser === browser) {
-          helper.removeListeners([listener]);
-          fulfill(target);
-        }
-      });
-    });
-    if (browserContext && browserContext.defaultViewportSize)
-      setViewportSizeForBrowser(browserContext.defaultViewportSize, browser, window);
+    let target = this._browserToTarget.get(browser);
+    while (!target) {
+      await helper.awaitEvent(this, TargetRegistry.Events.TargetCreated);
+      target = this._browserToTarget.get(browser);
+    }
     browser.focus();
-    if (browserContext.settings.timezoneId) {
+    if (browserContext.crossProcessCookie.settings.timezoneId) {
       if (await target.hasFailedToOverrideTimezone())
         throw new Error('Failed to override timezone');
     }
@@ -336,46 +326,119 @@ class TargetRegistry {
     return this._browserToTarget.get(browser);
   }
 
-  _targetForChannel(channel) {
-    const channelId = channel.channelId;
-    for (const target of this._browserToTarget.values()) {
-      if (target._channelIds.has(channelId))
-        return target;
-    }
-    return null;
+  targetForBrowserId(browserId) {
+    return this._browserIdToTarget.get(browserId);
   }
 }
 
 class PageTarget {
-  constructor(registry, win, gBrowser, tab, linkedBrowser, browserContext, opener) {
-    EventEmitter.decorate(this);
+  constructor(registry, win, tab, browserContext, opener) {
+    helper.decorateAsEventEmitter(this);
 
     this._targetId = helper.generateId();
     this._registry = registry;
     this._window = win;
-    this._gBrowser = gBrowser;
+    this._gBrowser = win.gBrowser;
     this._tab = tab;
-    this._linkedBrowser = linkedBrowser;
+    this._linkedBrowser = tab.linkedBrowser;
     this._browserContext = browserContext;
     this._viewportSize = undefined;
+    this._initialDPPX = this._linkedBrowser.browsingContext.overrideDPPX;
     this._url = 'about:blank';
     this._openerId = opener ? opener.id() : undefined;
-    this._channel = SimpleChannel.createForMessageManager(`browser::page[${this._targetId}]`, this._linkedBrowser.messageManager);
-    this._channelIds = new Set();
+    this._actor = undefined;
+    this._actorSequenceNumber = 0;
+    this._channel = new SimpleChannel(`browser::page[${this._targetId}]`, 'target-' + this._targetId);
+    this._videoRecordingInfo = undefined;
+    this._screencastRecordingInfo = undefined;
+    this._dialogs = new Map();
+    this.forcedColors = 'no-override';
+    this.mediumOverride = '';
+    this.crossProcessCookie = {
+      initScripts: [],
+      bindings: [],
+      interceptFileChooserDialog: false,
+    };
 
     const navigationListener = {
       QueryInterface: ChromeUtils.generateQI([Ci.nsIWebProgressListener, Ci.nsISupportsWeakReference]),
       onLocationChange: (aWebProgress, aRequest, aLocation) => this._onNavigated(aLocation),
     };
     this._eventListeners = [
+      helper.addObserver(this._updateModalDialogs.bind(this), 'tabmodal-dialog-loaded'),
       helper.addProgressListener(tab.linkedBrowser, navigationListener, Ci.nsIWebProgress.NOTIFY_LOCATION),
+      helper.addEventListener(this._linkedBrowser, 'DOMModalDialogClosed', event => this._updateModalDialogs()),
+      helper.addEventListener(this._linkedBrowser, 'WillChangeBrowserRemoteness', event => this._willChangeBrowserRemoteness()),
     ];
 
     this._disposed = false;
     browserContext.pages.add(this);
-    browserContext._firstPageCallback();
     this._registry._browserToTarget.set(this._linkedBrowser, this);
-    this._registry._browserBrowsingContextToTarget.set(this._linkedBrowser.browsingContext, this);
+    this._registry._browserIdToTarget.set(this._linkedBrowser.browsingContext.browserId, this);
+
+    this._registry.emit(TargetRegistry.Events.TargetCreated, this);
+  }
+
+  async activateAndRun(callback = () => {}, { muteNotificationsPopup = false } = {}) {
+    const ownerWindow = this._tab.linkedBrowser.ownerGlobal;
+    const tabBrowser = ownerWindow.gBrowser;
+    // Serialize all tab-switching commands per tabbed browser
+    // to disallow concurrent tab switching.
+    const result = (tabBrowser.__serializedChain ?? Promise.resolve()).then(async () => {
+      this._window.focus();
+      if (tabBrowser.selectedTab !== this._tab) {
+        const promise = helper.awaitEvent(ownerWindow, 'TabSwitchDone');
+        tabBrowser.selectedTab = this._tab;
+        await promise;
+      }
+      const notificationsPopup = muteNotificationsPopup ? this._linkedBrowser?.ownerDocument.getElementById('notification-popup') : null;
+      notificationsPopup?.style.setProperty('pointer-events', 'none');
+      try {
+        await callback();
+      } finally {
+        notificationsPopup?.style.removeProperty('pointer-events');
+      }
+    });
+    tabBrowser.__serializedChain = result.catch(error => { /* swallow errors to keep chain running */ });
+    return result;
+  }
+
+  frameIdToBrowsingContext(frameId) {
+    return helper.collectAllBrowsingContexts(this._linkedBrowser.browsingContext).find(bc => helper.browsingContextToFrameId(bc) === frameId);
+  }
+
+  nextActorSequenceNumber() {
+    return ++this._actorSequenceNumber;
+  }
+
+  setActor(actor) {
+    this._actor = actor;
+    this._channel.bindToActor(actor);
+  }
+
+  removeActor(actor) {
+    // Note: the order between setActor and removeActor is non-deterministic.
+    // Therefore we check that we are still bound to the actor that is being removed.
+    if (this._actor !== actor)
+      return;
+    this._actor = undefined;
+    this._channel.resetTransport();
+  }
+
+  _willChangeBrowserRemoteness() {
+    this.removeActor(this._actor);
+  }
+
+  dialog(dialogId) {
+    return this._dialogs.get(dialogId);
+  }
+
+  dialogs() {
+    return [...this._dialogs.values()];
+  }
+
+  async windowReady() {
+    await waitForWindowReady(this._window);
   }
 
   linkedBrowser() {
@@ -386,39 +449,158 @@ class PageTarget {
     return this._browserContext;
   }
 
+  updateOverridesForBrowsingContext(browsingContext = undefined) {
+    this.updateTouchOverride(browsingContext);
+    this.updateUserAgent(browsingContext);
+    this.updatePlatform(browsingContext);
+    this.updateDPPXOverride(browsingContext);
+    this.updateEmulatedMedia(browsingContext);
+    this.updateColorSchemeOverride(browsingContext);
+    this.updateReducedMotionOverride(browsingContext);
+    this.updateForcedColorsOverride(browsingContext);
+    this.updateForceOffline(browsingContext);
+  }
+
+  updateForceOffline(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).forceOffline = this._browserContext.forceOffline;
+  }
+
+  updateTouchOverride(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).touchEventsOverride = this._browserContext.touchOverride ? 'enabled' : 'none';
+  }
+
+  updateUserAgent(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).customUserAgent = this._browserContext.defaultUserAgent;
+  }
+
+  updatePlatform(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).customPlatform = this._browserContext.defaultPlatform;
+  }
+
+  updateDPPXOverride(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).overrideDPPX = this._browserContext.deviceScaleFactor || this._initialDPPX;
+  }
+
+  _updateModalDialogs() {
+    const prompts = new Set(this._linkedBrowser.tabModalPromptBox ? this._linkedBrowser.tabModalPromptBox.listPrompts() : []);
+    for (const dialog of this._dialogs.values()) {
+      if (!prompts.has(dialog.prompt())) {
+        this._dialogs.delete(dialog.id());
+        this.emit(PageTarget.Events.DialogClosed, dialog);
+      } else {
+        prompts.delete(dialog.prompt());
+      }
+    }
+    for (const prompt of prompts) {
+      const dialog = Dialog.createIfSupported(prompt);
+      if (!dialog)
+        continue;
+      this._dialogs.set(dialog.id(), dialog);
+      this.emit(PageTarget.Events.DialogOpened, dialog);
+    }
+  }
+
+  async updateViewportSize() {
+    await waitForWindowReady(this._window);
+    this.updateDPPXOverride();
+
+    // Viewport size is defined by three arguments:
+    // 1. default size. Could be explicit if set as part of `window.open` call, e.g.
+    //   `window.open(url, title, 'width=400,height=400')`
+    // 2. page viewport size
+    // 3. browserContext viewport size
+    //
+    // The "default size" (1) is only respected when the page is opened.
+    // Otherwise, explicitly set page viewport prevales over browser context
+    // default viewport.
+    const viewportSize = this._viewportSize || this._browserContext.defaultViewportSize;
+    if (viewportSize) {
+      const {width, height} = viewportSize;
+      this._linkedBrowser.style.setProperty('width', width + 'px');
+      this._linkedBrowser.style.setProperty('height', height + 'px');
+      this._linkedBrowser.style.setProperty('box-sizing', 'content-box');
+      this._linkedBrowser.closest('.browserStack').style.setProperty('overflow', 'auto');
+      this._linkedBrowser.closest('.browserStack').style.setProperty('contain', 'size');
+      this._linkedBrowser.closest('.browserStack').style.setProperty('scrollbar-width', 'none');
+      this._linkedBrowser.browsingContext.inRDMPane = true;
+
+      const stackRect = this._linkedBrowser.closest('.browserStack').getBoundingClientRect();
+      const toolbarTop = stackRect.y;
+      this._window.resizeBy(width - this._window.innerWidth, height + toolbarTop - this._window.innerHeight);
+
+      await this._channel.connect('').send('awaitViewportDimensions', { width, height });
+    } else {
+      this._linkedBrowser.style.removeProperty('width');
+      this._linkedBrowser.style.removeProperty('height');
+      this._linkedBrowser.style.removeProperty('box-sizing');
+      this._linkedBrowser.closest('.browserStack').style.removeProperty('overflow');
+      this._linkedBrowser.closest('.browserStack').style.removeProperty('contain');
+      this._linkedBrowser.closest('.browserStack').style.removeProperty('scrollbar-width');
+      this._linkedBrowser.browsingContext.inRDMPane = false;
+
+      const actualSize = this._linkedBrowser.getBoundingClientRect();
+      await this._channel.connect('').send('awaitViewportDimensions', {
+        width: actualSize.width,
+        height: actualSize.height,
+      });
+    }
+  }
+
+  setEmulatedMedia(mediumOverride) {
+    this.mediumOverride = mediumOverride || '';
+    this.updateEmulatedMedia();
+  }
+
+  updateEmulatedMedia(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).mediumOverride = this.mediumOverride;
+  }
+
+  setColorScheme(colorScheme) {
+    this.colorScheme = fromProtocolColorScheme(colorScheme);
+    this.updateColorSchemeOverride();
+  }
+
+  updateColorSchemeOverride(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).prefersColorSchemeOverride = this.colorScheme || this._browserContext.colorScheme || 'none';
+  }
+
+  setReducedMotion(reducedMotion) {
+    this.reducedMotion = fromProtocolReducedMotion(reducedMotion);
+    this.updateReducedMotionOverride();
+  }
+
+  updateReducedMotionOverride(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).prefersReducedMotionOverride = this.reducedMotion || this._browserContext.reducedMotion || 'none';
+  }
+
+  setForcedColors(forcedColors) {
+    this.forcedColors = fromProtocolForcedColors(forcedColors);
+    this.updateForcedColorsOverride();
+  }
+
+  updateForcedColorsOverride(browsingContext = undefined) {
+    (browsingContext || this._linkedBrowser.browsingContext).forcedColorsOverride = (this.forcedColors !== 'no-override' ? this.forcedColors : this._browserContext.forcedColors) || 'no-override';
+  }
+
+  async setInterceptFileChooserDialog(enabled) {
+    this.crossProcessCookie.interceptFileChooserDialog = enabled;
+    this._updateCrossProcessCookie();
+    await this._channel.connect('').send('setInterceptFileChooserDialog', enabled).catch(e => {});
+  }
+
   async setViewportSize(viewportSize) {
     this._viewportSize = viewportSize;
-    const actualSize = setViewportSizeForBrowser(viewportSize, this._linkedBrowser, this._window);
-    await this._channel.connect('').send('awaitViewportDimensions', {
-      width: actualSize.width,
-      height: actualSize.height
-    });
+    await this.updateViewportSize();
   }
 
-  connectSession(session) {
-    this._channel.connect('').send('attach', { sessionId: session.sessionId() });
-  }
-
-  disconnectSession(session) {
-    if (!this._disposed)
-      this._channel.connect('').emit('detach', { sessionId: session.sessionId() });
-  }
-
-  async close(runBeforeUnload = false) {
-    await this._gBrowser.removeTab(this._tab, {
+  close(runBeforeUnload = false) {
+    this._gBrowser.removeTab(this._tab, {
       skipPermitUnload: !runBeforeUnload,
     });
   }
 
-  initSession(session) {
-    const pageHandler = new PageHandler(this, session, this._channel);
-    const networkHandler = new NetworkHandler(this, session, this._channel);
-    session.registerHandler('Page', pageHandler);
-    session.registerHandler('Network', networkHandler);
-    session.registerHandler('Runtime', new RuntimeHandler(session, this._channel));
-    session.registerHandler('Accessibility', new AccessibilityHandler(session, this._channel));
-    pageHandler.enable();
-    networkHandler.enable();
+  channel() {
+    return this._channel;
   }
 
   id() {
@@ -439,16 +621,29 @@ class PageTarget {
     this._browserContext.grantPermissionsToOrigin(this._url);
   }
 
+  _updateCrossProcessCookie() {
+    Services.ppmm.sharedData.set('juggler:page-cookie-' + this._linkedBrowser.browsingContext.browserId, this.crossProcessCookie);
+    Services.ppmm.sharedData.flush();
+  }
+
   async ensurePermissions() {
     await this._channel.connect('').send('ensurePermissions', {}).catch(e => void e);
   }
 
-  async addScriptToEvaluateOnNewDocument(script) {
-    await this._channel.connect('').send('addScriptToEvaluateOnNewDocument', script).catch(e => void e);
+  async setInitScripts(scripts) {
+    this.crossProcessCookie.initScripts = scripts;
+    this._updateCrossProcessCookie();
+    await this.pushInitScripts();
   }
 
-  async addBinding(name, script) {
-    await this._channel.connect('').send('addBinding', { name, script }).catch(e => void e);
+  async pushInitScripts() {
+    await this._channel.connect('').send('setInitScripts', [...this._browserContext.crossProcessCookie.initScripts, ...this.crossProcessCookie.initScripts]).catch(e => void e);
+  }
+
+  async addBinding(worldName, name, script) {
+    this.crossProcessCookie.bindings.push({ worldName, name, script });
+    this._updateCrossProcessCookie();
+    await this._channel.connect('').send('addBinding', { worldName, name, script }).catch(e => void e);
   }
 
   async applyContextSetting(name, value) {
@@ -459,14 +654,157 @@ class PageTarget {
     return await this._channel.connect('').send('hasFailedToOverrideTimezone').catch(e => true);
   }
 
+  async _startVideoRecording({width, height, dir}) {
+    // On Mac the window may not yet be visible when TargetCreated and its
+    // NSWindow.windowNumber may be -1, so we wait until the window is known
+    // to be initialized and visible.
+    await this.windowReady();
+    const file = PathUtils.join(dir, helper.generateId() + '.webm');
+    if (width < 10 || width > 10000 || height < 10 || height > 10000)
+      throw new Error("Invalid size");
+
+    const docShell = this._gBrowser.ownerGlobal.docShell;
+    // Exclude address bar and navigation control from the video.
+    const rect = this.linkedBrowser().getBoundingClientRect();
+    const devicePixelRatio = this._window.devicePixelRatio;
+    let sessionId;
+    const registry = this._registry;
+    const screencastClient = {
+      QueryInterface: ChromeUtils.generateQI([Ci.nsIScreencastServiceClient]),
+      screencastFrame(data, deviceWidth, deviceHeight) {
+      },
+      screencastStopped() {
+        registry.emit(TargetRegistry.Events.ScreencastStopped, sessionId);
+      },
+    };
+    const viewport = this._viewportSize || this._browserContext.defaultViewportSize || { width: 0, height: 0 };
+    sessionId = screencastService.startVideoRecording(screencastClient, docShell, true, file, width, height, 0, viewport.width, viewport.height, devicePixelRatio * rect.top);
+    this._videoRecordingInfo = { sessionId, file };
+    this.emit(PageTarget.Events.ScreencastStarted);
+  }
+
+  _stopVideoRecording() {
+    if (!this._videoRecordingInfo)
+      throw new Error('No video recording in progress');
+    const videoRecordingInfo = this._videoRecordingInfo;
+    this._videoRecordingInfo = undefined;
+    screencastService.stopVideoRecording(videoRecordingInfo.sessionId);
+  }
+
+  videoRecordingInfo() {
+    return this._videoRecordingInfo;
+  }
+
+  async startScreencast({ width, height, quality }) {
+    // On Mac the window may not yet be visible when TargetCreated and its
+    // NSWindow.windowNumber may be -1, so we wait until the window is known
+    // to be initialized and visible.
+    await this.windowReady();
+    if (width < 10 || width > 10000 || height < 10 || height > 10000)
+      throw new Error("Invalid size");
+
+    const docShell = this._gBrowser.ownerGlobal.docShell;
+    // Exclude address bar and navigation control from the video.
+    const rect = this.linkedBrowser().getBoundingClientRect();
+    const devicePixelRatio = this._window.devicePixelRatio;
+
+    const self = this;
+    const screencastClient = {
+      QueryInterface: ChromeUtils.generateQI([Ci.nsIScreencastServiceClient]),
+      screencastFrame(data, deviceWidth, deviceHeight) {
+        if (self._screencastRecordingInfo)
+          self.emit(PageTarget.Events.ScreencastFrame, { data, deviceWidth, deviceHeight });
+      },
+      screencastStopped() {
+      },
+    };
+    const viewport = this._viewportSize || this._browserContext.defaultViewportSize || { width: 0, height: 0 };
+    const screencastId = screencastService.startVideoRecording(screencastClient, docShell, false, '', width, height, quality || 90, viewport.width, viewport.height, devicePixelRatio * rect.top);
+    this._screencastRecordingInfo = { screencastId };
+    return { screencastId };
+  }
+
+  screencastFrameAck({ screencastId }) {
+    if (!this._screencastRecordingInfo || this._screencastRecordingInfo.screencastId !== screencastId)
+      return;
+    screencastService.screencastFrameAck(screencastId);
+  }
+
+  stopScreencast() {
+    if (!this._screencastRecordingInfo)
+      throw new Error('No screencast in progress');
+    const { screencastId } = this._screencastRecordingInfo;
+    this._screencastRecordingInfo = undefined;
+    screencastService.stopVideoRecording(screencastId);
+  }
+
+  ensureContextMenuClosed() {
+    // Close context menu, if any, since it might capture mouse events on Linux
+    // and prevent browser shutdown on MacOS.
+    const doc = this._linkedBrowser.ownerDocument;
+    const contextMenu = doc.getElementById('contentAreaContextMenu');
+    if (contextMenu)
+      contextMenu.hidePopup();
+    const autocompletePopup = doc.getElementById('PopupAutoComplete');
+    if (autocompletePopup)
+      autocompletePopup.hidePopup();
+    const selectPopup = doc.getElementById('ContentSelectDropdown')?.menupopup;
+    if (selectPopup)
+      selectPopup.hidePopup()
+  }
+
   dispose() {
+    this.ensureContextMenuClosed();
     this._disposed = true;
+    if (this._videoRecordingInfo)
+      this._stopVideoRecording();
+    if (this._screencastRecordingInfo)
+      this.stopScreencast();
     this._browserContext.pages.delete(this);
     this._registry._browserToTarget.delete(this._linkedBrowser);
-    this._registry._browserBrowsingContextToTarget.delete(this._linkedBrowser.browsingContext);
-    helper.removeListeners(this._eventListeners);
+    this._registry._browserIdToTarget.delete(this._linkedBrowser.browsingContext.browserId);
+    try {
+      helper.removeListeners(this._eventListeners);
+    } catch (e) {
+      // In some cases, removing listeners from this._linkedBrowser fails
+      // because it is already half-destroyed.
+      if (e)
+        dump(e.message + '\n' + e.stack + '\n');
+    }
     this._registry.emit(TargetRegistry.Events.TargetDestroyed, this);
   }
+}
+
+PageTarget.Events = {
+  ScreencastStarted: Symbol('PageTarget.ScreencastStarted'),
+  ScreencastFrame: Symbol('PageTarget.ScreencastFrame'),
+  Crashed: Symbol('PageTarget.Crashed'),
+  DialogOpened: Symbol('PageTarget.DialogOpened'),
+  DialogClosed: Symbol('PageTarget.DialogClosed'),
+};
+
+function fromProtocolColorScheme(colorScheme) {
+  if (colorScheme === 'light' || colorScheme === 'dark')
+    return colorScheme;
+  if (colorScheme === null || colorScheme === 'no-preference')
+    return undefined;
+  throw new Error('Unknown color scheme: ' + colorScheme);
+}
+
+function fromProtocolReducedMotion(reducedMotion) {
+  if (reducedMotion === 'reduce' || reducedMotion === 'no-preference')
+    return reducedMotion;
+  if (reducedMotion === null)
+    return undefined;
+  throw new Error('Unknown reduced motion: ' + reducedMotion);
+}
+
+function fromProtocolForcedColors(forcedColors) {
+  if (forcedColors === 'active' || forcedColors === 'none')
+    return forcedColors;
+  if (forcedColors === null)
+    return undefined;
+  throw new Error('Unknown forced colors: ' + forcedColors);
 }
 
 class BrowserContext {
@@ -492,18 +830,51 @@ class BrowserContext {
     this.ignoreHTTPSErrors = undefined;
     this.downloadOptions = undefined;
     this.defaultViewportSize = undefined;
-    this.screencastOptions = undefined;
-    this.scriptsToEvaluateOnNewDocument = [];
-    this.bindings = [];
-    this.settings = {};
+    this.deviceScaleFactor = undefined;
+    this.defaultUserAgent = null;
+    this.defaultPlatform = null;
+    this.touchOverride = false;
+    this.forceOffline = false;
+    this.colorScheme = 'none';
+    this.forcedColors = 'no-override';
+    this.reducedMotion = 'none';
+    this.videoRecordingOptions = undefined;
+    this.crossProcessCookie = {
+      initScripts: [],
+      bindings: [],
+      settings: {},
+    };
     this.pages = new Set();
-    this._firstPagePromise = new Promise(f => this._firstPageCallback = f);
+  }
+
+  _updateCrossProcessCookie() {
+    Services.ppmm.sharedData.set('juggler:context-cookie-' + this.userContextId, this.crossProcessCookie);
+    Services.ppmm.sharedData.flush();
+  }
+
+  setColorScheme(colorScheme) {
+    this.colorScheme = fromProtocolColorScheme(colorScheme);
+    for (const page of this.pages)
+      page.updateColorSchemeOverride();
+  }
+
+  setReducedMotion(reducedMotion) {
+    this.reducedMotion = fromProtocolReducedMotion(reducedMotion);
+    for (const page of this.pages)
+      page.updateReducedMotionOverride();
+  }
+
+  setForcedColors(forcedColors) {
+    this.forcedColors = fromProtocolForcedColors(forcedColors);
+    for (const page of this.pages)
+      page.updateForcedColorsOverride();
   }
 
   async destroy() {
     if (this.userContextId !== 0) {
       ContextualIdentityService.remove(this.userContextId);
-      ContextualIdentityService.closeContainerTabs(this.userContextId);
+      for (const page of this.pages)
+        page.close();
       if (this.pages.size) {
         await new Promise(f => {
           const listener = helper.on(this._registry, TargetRegistry.Events.TargetDestroyed, () => {
@@ -520,6 +891,8 @@ class BrowserContext {
   }
 
   setProxy(proxy) {
+    // Clear AuthCache.
+    Services.obs.notifyObservers(null, "net:clear-active-logins");
     this._proxy = proxy;
   }
 
@@ -539,36 +912,51 @@ class BrowserContext {
     }
   }
 
+  setDefaultUserAgent(userAgent) {
+    this.defaultUserAgent = userAgent;
+    for (const page of this.pages)
+      page.updateUserAgent();
+  }
+
+  setDefaultPlatform(platform) {
+    this.defaultPlatform = platform;
+    for (const page of this.pages)
+      page.updatePlatform();
+  }
+
+  setTouchOverride(touchOverride) {
+    this.touchOverride = touchOverride;
+    for (const page of this.pages)
+      page.updateTouchOverride();
+  }
+
+  setForceOffline(forceOffline) {
+    this.forceOffline = forceOffline;
+    for (const page of this.pages)
+      page.updateForceOffline();
+  }
+
   async setDefaultViewport(viewport) {
     this.defaultViewportSize = viewport ? viewport.viewportSize : undefined;
-    if (!this.userContextId) {
-      // First page in the default context comes before onTabOpenListener
-      // so we don't set default viewport. Wait for it here and ensure the viewport.
-      await this._firstPagePromise;
-    }
-    const promises = Array.from(this.pages).map(async page => {
-      // Resize to new default, unless the page has a custom viewport.
-      if (!page._viewportSize)
-        await page.setViewportSize(this.defaultViewportSize);
-    });
-    await Promise.all([
-      this.applySetting('deviceScaleFactor', viewport ? viewport.deviceScaleFactor : undefined),
-      ...promises,
-    ]);
+    this.deviceScaleFactor = viewport ? viewport.deviceScaleFactor : undefined;
+    await Promise.all(Array.from(this.pages).map(page => page.updateViewportSize()));
   }
 
-  async addScriptToEvaluateOnNewDocument(script) {
-    this.scriptsToEvaluateOnNewDocument.push(script);
-    await Promise.all(Array.from(this.pages).map(page => page.addScriptToEvaluateOnNewDocument(script)));
+  async setInitScripts(scripts) {
+    this.crossProcessCookie.initScripts = scripts;
+    this._updateCrossProcessCookie();
+    await Promise.all(Array.from(this.pages).map(page => page.pushInitScripts()));
   }
 
-  async addBinding(name, script) {
-    this.bindings.push({ name, script });
-    await Promise.all(Array.from(this.pages).map(page => page.addBinding(name, script)));
+  async addBinding(worldName, name, script) {
+    this.crossProcessCookie.bindings.push({ worldName, name, script });
+    this._updateCrossProcessCookie();
+    await Promise.all(Array.from(this.pages).map(page => page.addBinding(worldName, name, script)));
   }
 
   async applySetting(name, value) {
-    this.settings[name] = value;
+    this.crossProcessCookie.settings[name] = value;
+    this._updateCrossProcessCookie();
     await Promise.all(Array.from(this.pages).map(page => page.applyContextSetting(name, value)));
   }
 
@@ -681,10 +1069,78 @@ class BrowserContext {
     return result;
   }
 
-  setScreencastOptions(options) {
-    this.screencastOptions = options;
+  async setVideoRecordingOptions(options) {
+    this.videoRecordingOptions = options;
+    const promises = [];
+    for (const page of this.pages) {
+      if (options)
+        promises.push(page._startVideoRecording(options));
+      else if (page._videoRecordingInfo)
+        promises.push(page._stopVideoRecording());
+    }
+    await Promise.all(promises);
   }
 }
+
+class Dialog {
+  static createIfSupported(prompt) {
+    const type = prompt.args.promptType;
+    switch (type) {
+      case 'alert':
+      case 'alertCheck':
+        return new Dialog(prompt, 'alert');
+      case 'prompt':
+        return new Dialog(prompt, 'prompt');
+      case 'confirm':
+      case 'confirmCheck':
+        return new Dialog(prompt, 'confirm');
+      case 'confirmEx':
+        return new Dialog(prompt, 'beforeunload');
+      default:
+        return null;
+    };
+  }
+
+  constructor(prompt, type) {
+    this._id = helper.generateId();
+    this._type = type;
+    this._prompt = prompt;
+  }
+
+  id() {
+    return this._id;
+  }
+
+  message() {
+    return this._prompt.ui.infoBody.textContent;
+  }
+
+  type() {
+    return this._type;
+  }
+
+  prompt() {
+    return this._prompt;
+  }
+
+  dismiss() {
+    if (this._prompt.ui.button1)
+      this._prompt.ui.button1.click();
+    else
+      this._prompt.ui.button0.click();
+  }
+
+  defaultValue() {
+    return this._prompt.ui.loginTextbox.value;
+  }
+
+  accept(promptValue) {
+    if (typeof promptValue === 'string' && this._type === 'prompt')
+      this._prompt.ui.loginTextbox.value = promptValue;
+    this._prompt.ui.button0.click();
+  }
+}
+
 
 function dirPath(path) {
   return path.substring(0, path.lastIndexOf('/') + 1);
@@ -703,33 +1159,8 @@ async function waitForWindowReady(window) {
       }, "browser-delayed-startup-finished");
     }));
   }
-  if (window.document.readyState !== 'complete') {
-    await new Promise(fulfill => {
-      window.addEventListener('load', function listener() {
-        window.removeEventListener('load', listener);
-        fulfill();
-      });
-    });
-  }
-}
-
-function setViewportSizeForBrowser(viewportSize, browser, window) {
-  if (viewportSize) {
-    const {width, height} = viewportSize;
-    const rect = browser.getBoundingClientRect();
-    window.resizeBy(width - rect.width, height - rect.height);
-    browser.style.setProperty('min-width', width + 'px');
-    browser.style.setProperty('min-height', height + 'px');
-    browser.style.setProperty('max-width', width + 'px');
-    browser.style.setProperty('max-height', height + 'px');
-  } else {
-    browser.style.removeProperty('min-width');
-    browser.style.removeProperty('min-height');
-    browser.style.removeProperty('max-width');
-    browser.style.removeProperty('max-height');
-  }
-  const rect = browser.getBoundingClientRect();
-  return { width: rect.width, height: rect.height };
+  if (window.document.readyState !== 'complete')
+    await helper.awaitEvent(window, 'load');
 }
 
 TargetRegistry.Events = {
@@ -737,7 +1168,9 @@ TargetRegistry.Events = {
   TargetDestroyed: Symbol('TargetRegistry.Events.TargetDestroyed'),
   DownloadCreated: Symbol('TargetRegistry.Events.DownloadCreated'),
   DownloadFinished: Symbol('TargetRegistry.Events.DownloadFinished'),
+  ScreencastStopped: Symbol('TargetRegistry.ScreencastStopped'),
 };
 
-var EXPORTED_SYMBOLS = ['TargetRegistry'];
+var EXPORTED_SYMBOLS = ['TargetRegistry', 'PageTarget'];
 this.TargetRegistry = TargetRegistry;
+this.PageTarget = PageTarget;

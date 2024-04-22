@@ -1,6 +1,5 @@
 # Contributing
 
-<!-- gen:toc -->
 - [How to Contribute](#how-to-contribute)
   * [Getting Code](#getting-code)
   * [Code reviews](#code-reviews)
@@ -13,11 +12,20 @@
   * [Public API Coverage](#public-api-coverage)
 - [Contributor License Agreement](#contributor-license-agreement)
   * [Code of Conduct](#code-of-conduct)
-<!-- gen:stop -->
 
 ## How to Contribute
 
+We strongly recommend that you open an issue before beginning any code modifications. This is particularly important if the changes involve complex logic or if the existing code isn't immediately clear. By doing so, we can discuss and agree upon the best approach to address a bug or implement a feature, ensuring that our efforts are aligned.
+
 ### Getting Code
+
+Make sure you're running Node.js 20 to verify and upgrade NPM do:
+
+```bash
+node --version
+npm --version
+npm i -g npm@latest
+```
 
 1. Clone this repository
 
@@ -29,7 +37,7 @@ cd playwright
 2. Install dependencies
 
 ```bash
-npm install
+npm ci
 ```
 
 3. Build Playwright
@@ -53,7 +61,7 @@ information on using pull requests.
 
 ### Code Style
 
-- Coding style is fully defined in [.eslintrc](https://github.com/microsoft/playwright/blob/master/.eslintrc.js)
+- Coding style is fully defined in [.eslintrc](https://github.com/microsoft/playwright/blob/main/.eslintrc.js)
 - Comments should be generally avoided. If the code would not be understood without comments, consider re-writing the code to make it self-explanatory.
 
 To run code linter, use:
@@ -69,7 +77,7 @@ When authoring new API methods, consider the following:
 - Expose as little information as needed. When in doubt, don’t expose new information.
 - Methods are used in favor of getters/setters.
   - The only exception is namespaces, e.g. `page.keyboard` and `page.coverage`
-- All string literals must be small case. This includes event names and option values.
+- All string literals must be lowercase. This includes event names and option values.
 - Avoid adding "sugar" API (API that is trivially implementable in user-space) unless they're **very** common.
 
 ### Commit Messages
@@ -101,20 +109,26 @@ Example:
 ```
 fix(firefox): make sure session cookies work
 
-This patch fixes session cookies in firefox browser.
+This patch fixes session cookies in the firefox browser.
 
 Fixes #123, fixes #234
 ```
 
 ### Writing Documentation
 
-All public API should have a descriptive entry in [`docs/api.md`](https://github.com/microsoft/playwright/blob/master/docs/api.md). There's a [documentation linter](https://github.com/microsoft/playwright/tree/master/utils/doclint) which makes sure documentation is aligned with the codebase.
+All API classes, methods, and events should have a description in [`docs/src`](https://github.com/microsoft/playwright/blob/main/docs/src). There's a [documentation linter](https://github.com/microsoft/playwright/tree/main/utils/doclint) which makes sure documentation is aligned with the codebase.
 
 To run the documentation linter, use:
 
 ```bash
 npm run doc
 ```
+
+To build the documentation site locally and test how your changes will look in practice:
+
+1. Clone the [microsoft/playwright.dev](https://github.com/microsoft/playwright.dev) repo
+1. Follow [the playwright.dev README instructions to "roll docs"](https://github.com/microsoft/playwright.dev/#roll-docs) against your local `playwright` repo with your changes in progress
+1. Follow [the playwright.dev README instructions to "run dev server"](https://github.com/microsoft/playwright.dev/#run-dev-server) to view your changes
 
 ### Adding New Dependencies
 
@@ -132,60 +146,58 @@ A barrier for introducing new installation dependencies is especially high:
 - Tests should be *hermetic*. Tests should not depend on external services.
 - Tests should work on all three platforms: Mac, Linux and Win. This is especially important for screenshot tests.
 
-Playwright tests are located in [`test/test.js`](https://github.com/microsoft/playwright/blob/master/test/test.js)
-and are written with a [TestRunner](https://github.com/microsoft/playwright/tree/master/utils/testrunner) framework.
+Playwright tests are located in [`tests`](https://github.com/microsoft/playwright/blob/main/tests) and use `@playwright/test` test runner.
 These are integration tests, making sure public API methods and events work as expected.
 
 - To run all tests:
 
 ```bash
+npx playwright install
 npm run test
 ```
+
+Be sure to run `npm run build` or let `npm run watch` run before you re-run the
+tests after making your changes to check them.
 
 - To run all tests in Chromium
 ```bash
 npm run ctest # also `ftest` for firefox and `wtest` for WebKit
 ```
 
-- To run tests in parallel, use `-j` flag:
-
+- To run the Playwright test runner tests
 ```bash
-npm run wtest -- -j 4
+npm run ttest
+npm run ttest -- --grep "specific test"
 ```
 
-- To run tests in "verbose" mode or to stop testrunner on first failure:
-
-```bash
-npm run ftest -- --verbose
-npm run ftest -- --break-on-failure
-```
-
-- To run a specific test, substitute the `it` with `fit` (mnemonic rule: '*focus it*'):
+- To run a specific test, substitute `it` with `it.only`, or use the `--grep 'My test'` CLI parameter:
 
 ```js
 ...
-// Using "fit" to run specific test
-fit('should work', async ({server, page}) => {
+// Using "it.only" to run a specific test
+it.only('should work', async ({server, page}) => {
+  const response = await page.goto(server.EMPTY_PAGE);
+  expect(response.ok).toBe(true);
+});
+// or
+playwright test --config=xxx --grep 'should work'
+```
+
+- To disable a specific test, substitute `it` with `it.skip`:
+
+```js
+...
+// Using "it.skip" to skip a specific test
+it.skip('should work', async ({server, page}) => {
   const response = await page.goto(server.EMPTY_PAGE);
   expect(response.ok).toBe(true);
 });
 ```
 
-- To disable a specific test, substitute the `it` with `xit` (mnemonic rule: '*cross it*'):
-
-```js
-...
-// Using "xit" to skip specific test
-xit('should work', async ({server, page}) => {
-  const response = await page.goto(server.EMPTY_PAGE);
-  expect(response.ok).toBe(true);
-});
-```
-
-- To run tests in non-headless (headful) mode:
+- To run tests in non-headless (headed) mode:
 
 ```bash
-HEADLESS=false npm run ctest
+npm run ctest -- --headed
 ```
 
 - To run tests with custom browser executable, specify `CRPATH`, `WKPATH` or `FFPATH` env variable that points to browser executable:
@@ -197,13 +209,7 @@ CRPATH=<path-to-executable> npm run ctest
 - To run tests in slow-mode:
 
 ```bash
-HEADLESS=false SLOW_MO=500 npm run wtest
-```
-
-- To debug a test, "focus" a test first and then run:
-
-```bash
-BROWSER=chromium node --inspect-brk test/test.js
+SLOW_MO=500 npm run wtest -- --headed
 ```
 
 - When should a test be marked with `skip` or `fail`?
@@ -225,18 +231,6 @@ BROWSER=chromium node --inspect-brk test/test.js
     with `fail(CHROMIUM || WEBKIT)` since Playwright performing these actions
     currently diverges from what a user would experience driving a Chromium or
     WebKit.
-
-### Public API Coverage
-
-Every public API method or event should be called at least once in tests. To ensure this, there's a `coverage` command which tracks calls to public API and reports back if some methods/events were not called.
-
-Run all tests for all browsers with coverage enabled:
-
-```bash
-npm run coverage
-```
-
-There are also per-browser commands:" `npm run ccoverage`, `npm run fcoverage` and `npm run wcoverage`.
 
 ## Contributor License Agreement
 
